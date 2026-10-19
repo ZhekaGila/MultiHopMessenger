@@ -1,67 +1,152 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const MultiHopApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class MultiHopApp extends StatelessWidget{
+  const MultiHopApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context){
     return MaterialApp(
-      title: 'Flutter Demo',
+      debugShowCheckedModeBanner: false,
+      title: 'MultiHop Messenger',
       theme: ThemeData(
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blue,
+        ),
+        useMaterial3:true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const HomeScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-  final String title;
+class HomeScreen extends StatefulWidget{
+  const HomeScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _HomeScreenState extends State<HomeScreen>{
+  static const channel = MethodChannel('multihop/bluetooth');
 
-  void _incrementCounter() {
-    setState(() {
-      _counter++;
-    });
+  String status = 'Waiting for action ...';
+
+  Future<void> testKotlin() async{
+    try{
+      final result = await channel.invokeMethod<String>('testConnection');
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'No response';
+      });
+    } on PlatformException catch (e){
+      if (!mounted) return;
+      setState(() {
+        status = 'Error: ${e.message}';
+      });
+    } on MissingPluginException{
+      if (!mounted) return;
+      setState(() {
+        status = 'Kotlin channel not found';
+      });
+    }
+  }
+
+  Future<void> checkBluetooth() async{
+    try{
+      final result = await channel.invokeMethod<String>('checkBluetooth');
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'No responce';
+      });
+    } on PlatformException catch (e){
+      if (!mounted) return;
+      setState((){
+        status = 'Error: ${e.message}';
+      });
+    } on MissingPluginException{
+      if (!mounted) return;
+      setState(() {
+        status = 'Bluetooth method not found';
+      });
+    }
+  }
+
+  Future<void> requestBluetoothPermission() async{
+    try{
+      final result = await channel.invokeMethod<String>(
+        'requestBluetoothPermission',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'No response';
+      });
+    } on PlatformException catch (e){
+      if (!mounted) return;
+      setState(() {
+        status = 'Error: ${e.message}';
+      });
+    }
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context){
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
+        title: const Text('MultiHop Messenger'),
       ),
       body: Center(
         child: Column(
-          mainAxisAlignment: .center,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('You have pushed the button this many times:'),
+            const Icon(
+              Icons.bluetooth,
+              size: 70,
+              color: Colors.blue,
+            ),
+
+            const SizedBox(height: 20),
+
             Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+              status,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 18),
+            ),
+
+            const SizedBox(height: 30),
+
+            ElevatedButton(
+              onPressed: testKotlin,
+              child: const Text('Test Kotlin Connection'),
+            ),
+
+            const SizedBox(height: 12),
+
+            ElevatedButton(
+              onPressed: checkBluetooth,
+              child: const Text('Check Bluetooth'),
+            ),
+
+            const SizedBox (height: 12),
+
+            ElevatedButton(
+              onPressed: requestBluetoothPermission,
+              child: const Text('Request Bluetooth Permission'),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ),
     );
+
   }
-
-
 }

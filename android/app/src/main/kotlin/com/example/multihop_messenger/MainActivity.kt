@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.app.Activity
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -13,6 +14,21 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
 
     private val channelName = "multihop/bluetooth"
+
+    private val bluetoothPermissionRequestCode = 1001
+
+    private fun requestBluetoothPermission()
+    {
+        if (Build.VERSION.SDK_INT >= 31){
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_SCAN
+                ),
+                bluetoothPermissionRequestCode
+            )
+        }
+    }
 
     override fun configureFlutterEngine(
         flutterEngine: FlutterEngine
@@ -25,6 +41,12 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
 
             when (call.method) {
+
+                "requestBluetoothPermission" -> {
+                    requestBluetoothPermission()
+                    result.success("Permission request started")
+                }
+
                 "testConnection" -> {
                     result.success("Hello from Kotlin!")
                 }
