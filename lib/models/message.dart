@@ -1,5 +1,7 @@
 import 'package:uuid/uuid.dart';
 
+import 'dart:convert';
+
 class Message {
   final String id;
   final String senderId;
@@ -35,8 +37,46 @@ class Message {
     );
   }
 
-  Map<String,Object?> toMap(){
-    return{
+  Map<String, dynamic> toJson() {
+    return {
+      'type': 'chat',
+      'id': id,
+      'senderId': senderId,
+      'receiverId': receiverId,
+      'text': text,
+      'createdAt': createdAt.toUtc().toIso8601String(),
+      'hopCount': hopCount,
+    };
+  }
+
+  String toWireJson() {
+    return jsonEncode(toJson());
+  }
+
+  factory Message.fromWireJson(String raw) {
+    final data = jsonDecode(raw);
+
+    if (data is! Map<String, dynamic>) {
+      throw const FormatException('Invalid JSON object');
+    }
+
+    if (data['type'] != 'chat') {
+      throw const FormatException('Not a chat message');
+    }
+
+    return Message(
+      id: data['id'] as String,
+      senderId: data['senderId'] as String,
+      receiverId: data['receiverId'] as String,
+      text: data['text'] as String,
+      createdAt: DateTime.parse(data['createdAt'] as String),
+      status: 'received',
+      hopCount: data['hopCount'] as int,
+    );
+  }
+
+  Map<String, Object?> toMap() {
+    return {
       'id': id,
       'sender_id': senderId,
       'receiver_id': receiverId,
@@ -47,7 +87,7 @@ class Message {
     };
   }
 
-  factory Message.fromMap(Map<String, Object?> map){
+  factory Message.fromMap(Map<String, Object?> map) {
     return Message(
       id: map['id'] as String,
       senderId: map['sender_id'] as String,
@@ -59,15 +99,12 @@ class Message {
     );
   }
 
-  Message copyWith({
-    String? status,
-    int? hopCount,
-  }){
+  Message copyWith({String? status, int? hopCount}) {
     return Message(
-      id:id,
+      id: id,
       senderId: senderId,
       receiverId: receiverId,
-      text:text,
+      text: text,
       createdAt: createdAt,
       status: status ?? this.status,
       hopCount: hopCount ?? this.hopCount,

@@ -46,13 +46,15 @@ class DatabaseHelper {
     return _database!;
   }
 
-  Future<void> insertMessage(Message message) async {
+  Future<bool> insertMessage(Message message) async {
     final db = await database;
-    await db.insert(
+    final rowId = await db.insert(
       'messages',
       message.toMap(),
       conflictAlgorithm: ConflictAlgorithm.ignore,
     );
+
+    return rowId != 0;
   }
 
   Future<List<Message>> getAllMessages() async {
@@ -80,6 +82,19 @@ class DatabaseHelper {
       orderBy: 'created_at ASC',
     );
     return rows.map(Message.fromMap).toList();
+  }
+
+  Future<List<Message>> getMessagesForReceiver(String receiverId) async {
+    final db = await database;
+
+    final maps = await db.query(
+      'messages',
+      where: 'receiver_id = ?',
+      whereArgs: [receiverId],
+      orderBy: 'created_at ASC',
+    );
+
+    return maps.map((map) => Message.fromMap(map)).toList();
   }
 
   Future<void> migrateLegacySenderId(String deviceId) async {

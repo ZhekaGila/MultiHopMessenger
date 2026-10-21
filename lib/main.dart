@@ -1,11 +1,13 @@
-
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
 import 'database/database_helper.dart';
 import 'models/message.dart';
 import 'services/device_identity.dart';
+
+import 'dart:convert';
 
 void main() {
   runApp(const MultiHopApp());
@@ -32,10 +34,7 @@ class BluetoothDeviceInfo {
   final String name;
   final String address;
 
-  BluetoothDeviceInfo({
-    required this.name,
-    required this.address,
-  });
+  BluetoothDeviceInfo({required this.name, required this.address});
 
   factory BluetoothDeviceInfo.fromMap(Map<dynamic, dynamic> map) {
     return BluetoothDeviceInfo(
@@ -50,11 +49,7 @@ class ChatMessage {
   final bool isMine;
   final DateTime time;
 
-  ChatMessage({
-    required this.text,
-    required this.isMine,
-    required this.time,
-  });
+  ChatMessage({required this.text, required this.isMine, required this.time});
 }
 
 class HomeScreen extends StatefulWidget {
@@ -67,11 +62,10 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   static const channel = MethodChannel('multihop/bluetooth');
 
-  static const eventChannel = EventChannel(
-    'multihop/bluetooth_events',
-  );
+  static const eventChannel = EventChannel('multihop/bluetooth_events');
 
   final messageController = TextEditingController();
+  final receiverController = TextEditingController();
   final scrollController = ScrollController();
 
   StreamSubscription<dynamic>? eventSubscription;
@@ -86,6 +80,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   String localDeviceId = '';
 
+  String peerDeviceId = '';
+
+  static const int maxHopCount = 5;
+
   bool get isConnected => connectionStatus.startsWith('Connected:');
 
   @override
@@ -94,17 +92,153 @@ class _HomeScreenState extends State<HomeScreen> {
 
     initializeDeviceIdentity();
 
-    eventSubscription = eventChannel
-        .receiveBroadcastStream()
-        .listen(
-          handleBluetoothEvent,
-          onError: (Object error) {
-            if (!mounted) return;
-            setState(() {
-              status = 'Event error: $error';
-            });
-          },
+    eventSubscription = eventChannel.receiveBroadcastStream().listen(
+      handleBluetoothEvent,
+      onError: (Object error) {
+        if (!mounted) return;
+        setState(() {
+          status = 'Event error: $error';
+        });
+      },
+    );
+  }
+
+  Future<void> sendHello() async {
+    if (!isConnected || localDeviceId.isEmpty) {
+      return;
+    }
+
+    final helloPacket = {'type': 'hello', 'deviceId': localDeviceId};
+
+    final jsonString = jsonEncode(helloPacket);
+
+    try {
+      await channel.invokeMethod<String>('sendMessage', {
+        'message': jsonString,
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Hello error: $e';
+      });
+    }
+  }
+
+  Future<void> saveReceivedJsonMessage(Message message) async {
+    try {
+      final savedMessage = message.copyWith(status: 'received');
+
+      final inserted = await DatabaseHelper.instance.insertMessage(
+        savedMessage,
+      );
+
+      if (!inserted) {
+        debugPrint('Duplicate message ignored: ${message.id}');
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        messages.add(
+          ChatMessage(
+            text: savedMessage.text,
+            isMine: false,
+            time: savedMessage.createdAt,
+          ),
         );
+      });
+
+      scrollToBottom();
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Receive error: $e';
+      });
+    }
+  }
+
+  Future<void> forwardMessagesToPeer() async {
+    if (!isConnected || peerDeviceId.isEmpty) {
+      return;
+    }
+
+    final pendingMessages = await DatabaseHelper.instance
+        .getMessagesForReceiver(peerDeviceId);
+
+    for (final message in pendingMessages) {
+      if (!isConnected) {
+        break;
+      }
+
+      if (message.senderId == localDeviceId) {
+        continue;
+      }
+
+      if (message.hopCount >= maxHopCount) {
+        debugPrint('Hop limit reached: ${message.id}');
+        continue;
+      }
+
+      final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
+
+      try {
+        await channel.invokeMethod<String>('sendMessage', {
+          'message': forwardedMessage.toWireJson(),
+        });
+
+        debugPrint('Forwarded message ${message.id} to $peerDeviceId');
+      } catch (e) {
+        debugPrint('Forwarding error: $e');
+        break;
+      }
+    }
+  }
+
+  void handleIncomingPacket(String raw) {
+    try {
+      final data = jsonDecode(raw);
+
+      if (data is! Map<String, dynamic>) {
+        return;
+      }
+
+      final packetType = data['type'];
+
+      if (packetType == 'hello') {
+        final receivedDeviceId = data['deviceId'];
+
+        if (receivedDeviceId is String &&
+            receivedDeviceId.isNotEmpty &&
+            receivedDeviceId != localDeviceId) {
+          setState(() {
+            peerDeviceId = receivedDeviceId;
+            status = 'Peer UUID received!';
+          });
+
+          forwardMessagesToPeer();
+        }
+
+        return;
+      }
+
+      if (packetType == 'chat') {
+        final message = Message.fromWireJson(raw);
+
+        if (message.receiverId == localDeviceId) {
+          saveReceivedJsonMessage(message);
+        } else {
+          saveRelayMessage(message);
+        }
+
+        return;
+      }
+    } catch (e) {
+      setState(() {
+        status = 'Invalid packet: $e';
+      });
+    }
   }
 
   void handleBluetoothEvent(dynamic event) {
@@ -114,24 +248,21 @@ class _HomeScreenState extends State<HomeScreen> {
     final value = event['value']?.toString() ?? '';
 
     if (type == 'status') {
+      final wasConnected = isConnected;
+
       setState(() {
         connectionStatus = value;
+
+        if (!value.startsWith('Connected:')) {
+          peerDeviceId = '';
+        }
       });
+
+      if (isConnected && !wasConnected) {
+        sendHello();
+      }
     } else if (type == 'message') {
-
-      saveIncomingMessage(value);
-    
-      setState(() {
-        messages.add(
-          ChatMessage(
-            text: value,
-            isMine: false,
-            time: DateTime.now(),
-          ),
-        );
-      });
-
-      scrollToBottom();
+      handleIncomingPacket(value);
     }
   }
 
@@ -195,10 +326,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> connectToDevice(String address) async {
     try {
-      final result = await channel.invokeMethod<String>(
-        'connectToDevice',
-        {'address': address},
-      );
+      final result = await channel.invokeMethod<String>('connectToDevice', {
+        'address': address,
+      });
 
       if (!mounted) return;
 
@@ -216,9 +346,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> refreshConnectionStatus() async {
     try {
-      final result = await channel.invokeMethod<String>(
-        'getConnectionStatus',
-      );
+      final result = await channel.invokeMethod<String>('getConnectionStatus');
 
       if (!mounted) return;
 
@@ -237,37 +365,42 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
 
-    if (text.isEmpty || !isConnected || sending || localDeviceId.isEmpty) return;
+    final destinationId = receiverController.text.trim().isEmpty
+        ? peerDeviceId
+        : receiverController.text.trim();
 
+    if (text.isEmpty ||
+        !isConnected ||
+        sending ||
+        localDeviceId.isEmpty ||
+        peerDeviceId.isEmpty) {
+      return;
+    }
     setState(() {
       sending = true;
     });
 
     try {
-      final result = await channel.invokeMethod<String>(
-        'sendMessage',
-        {'message': text},
+      final message = Message.create(
+        senderId: localDeviceId,
+        receiverId: destinationId,
+        text: text,
       );
+
+      final result = await channel.invokeMethod<String>('sendMessage', {
+        'message': message.toWireJson(),
+      });
 
       if (!mounted) return;
 
       if (result == 'Message sent') {
-
-        final savedMessage = Message.create(
-          senderId: localDeviceId,
-          receiverId: 'remote_device',
-          text: text,
-        ).copyWith(status: 'sent');
+        final savedMessage = message.copyWith(status: 'sent');
 
         await DatabaseHelper.instance.insertMessage(savedMessage);
 
         setState(() {
           messages.add(
-            ChatMessage(
-              text: text,
-              isMine: true,
-              time: DateTime.now(),
-            ),
+            ChatMessage(text: text, isMine: true, time: DateTime.now()),
           );
 
           messageController.clear();
@@ -295,60 +428,69 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> testDatabase() async{
-    try{
+  Future<void> testDatabase() async {
+    try {
       final message = Message.create(
         senderId: 'test_phone_a',
         receiverId: 'test_phone_b',
         text: 'Hello SQLite!',
       );
-        
+
       await DatabaseHelper.instance.insertMessage(message);
 
       final savedMessages = await DatabaseHelper.instance.getAllMessages();
 
       if (!mounted) return;
 
-      setState((){
-        status = 'SQLite works! Saved message: ' '${savedMessages.length}';
+      setState(() {
+        status =
+            'SQLite works! Saved message: '
+            '${savedMessages.length}';
       });
-    }catch (e){
-      if(!mounted) return;
+    } catch (e) {
+      if (!mounted) return;
 
-      setState((){
+      setState(() {
         status = 'SQLite error: $e';
       });
     }
   }
 
-  Future<void> loadMessagesFromDatabase() async{
-    try{
+  Future<void> loadMessagesFromDatabase() async {
+    try {
       final savedMessages = await DatabaseHelper.instance.getAllMessages();
+      final chatMessages = savedMessages
+          .where(
+            (message) =>
+                message.senderId == localDeviceId ||
+                message.receiverId == localDeviceId,
+          )
+          .toList();
 
       if (!mounted) return;
 
-      setState((){
-        messages = savedMessages.map((message){
+      setState(() {
+        messages = chatMessages.map((message) {
           return ChatMessage(
             text: message.text,
             isMine: message.senderId == localDeviceId,
             time: message.createdAt,
-            );
+          );
         }).toList();
       });
 
       scrollToBottom();
     } catch (e) {
-      if(!mounted) return;
+      if (!mounted) return;
 
-      setState((){
+      setState(() {
         status = 'Database error: $e';
       });
     }
   }
 
-  Future<void> saveIncomingMessage(String text) async{
-    try{
+  Future<void> saveIncomingMessage(String text) async {
+    try {
       final message = Message.create(
         senderId: 'remote_device',
         receiverId: localDeviceId,
@@ -359,21 +501,41 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (!mounted) return;
 
-      setState((){
+      setState(() {
         messages.add(
-          ChatMessage(text: text,
-           isMine: false, 
-           time: message.createdAt,),
+          ChatMessage(text: text, isMine: false, time: message.createdAt),
         );
       });
 
       scrollToBottom();
-    }catch(e){
-      if(!mounted) return;
+    } catch (e) {
+      if (!mounted) return;
 
-      setState((){
+      setState(() {
         status = 'Failed to save incoming message: $e';
       });
+    }
+  }
+
+  Future<void> saveRelayMessage(Message message) async {
+    try {
+      final relayMessage = message.copyWith(status: 'pending');
+
+      final inserted = await DatabaseHelper.instance.insertMessage(
+        relayMessage,
+      );
+
+      if (inserted) {
+        debugPrint('Relay message saved: ${message.id}');
+
+        debugPrint('Destination: ${message.receiverId}');
+
+        debugPrint('Hop count: ${message.hopCount}');
+      } else {
+        debugPrint('Duplicate relay message ignored: ${message.id}');
+      }
+    } catch (e) {
+      debugPrint('Relay save error: $e');
     }
   }
 
@@ -388,6 +550,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
       await DatabaseHelper.instance.migrateLegacySenderId(id);
       await loadMessagesFromDatabase();
+
+      if (isConnected) {
+        await sendHello();
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -401,33 +567,51 @@ class _HomeScreenState extends State<HomeScreen> {
     eventSubscription?.cancel();
     messageController.dispose();
     scrollController.dispose();
+    receiverController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('MultiHop Messenger'),
-      ),
+      appBar: AppBar(title: const Text('MultiHop Messenger')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const Text('My Device ID:', style: TextStyle(fontWeight: FontWeight.bold)),
-          SelectableText(localDeviceId.isEmpty ? 'Loading...' : localDeviceId),
-          const Divider(height: 30),
-          const Icon(
-            Icons.bluetooth,
-            size: 55,
-            color: Colors.blue,
+          const Text(
+            'My Device ID:',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+
+          const SizedBox(height: 12),
+
+          TextField(
+            controller: receiverController,
+            decoration: const InputDecoration(
+              labelText: 'Destination UUID',
+              hintText: 'Enter receiver device UUID',
+              border: OutlineInputBorder(),
+            ),
           ),
 
           const SizedBox(height: 8),
 
-          Text(
-            status,
-            textAlign: TextAlign.center,
+          SelectableText(localDeviceId.isEmpty ? 'Loading...' : localDeviceId),
+          const SizedBox(height: 8),
+          const Text(
+            'Connected Peer UUID:',
+            style: TextStyle(fontWeight: FontWeight.bold),
           ),
+
+          SelectableText(
+            peerDeviceId.isEmpty ? 'Not received yet' : peerDeviceId,
+          ),
+          const Divider(height: 30),
+          const Icon(Icons.bluetooth, size: 55, color: Colors.blue),
+
+          const SizedBox(height: 8),
+
+          Text(status, textAlign: TextAlign.center),
 
           const SizedBox(height: 12),
 
@@ -437,8 +621,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
 
           ElevatedButton(
-            onPressed: () =>
-                callKotlin('requestBluetoothPermission'),
+            onPressed: () => callKotlin('requestBluetoothPermission'),
             child: const Text('Request Bluetooth Permission'),
           ),
 
@@ -446,10 +629,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
           const Text(
             'Bluetooth Server',
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-            ),
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
 
           ElevatedButton(
@@ -466,10 +646,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
           const Text(
             'Bluetooth Client',
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-            ),
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
 
           ElevatedButton(
@@ -494,18 +671,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
           const Text(
             'Connection Status',
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-            ),
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
 
           const SizedBox(height: 8),
 
-          Text(
-            connectionStatus,
-            textAlign: TextAlign.center,
-          ),
+          Text(connectionStatus, textAlign: TextAlign.center),
 
           ElevatedButton(
             onPressed: refreshConnectionStatus,
@@ -531,10 +702,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
           const Text(
             'Bluetooth Chat',
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-            ),
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
 
           const SizedBox(height: 12),
@@ -547,9 +715,7 @@ class _HomeScreenState extends State<HomeScreen> {
               borderRadius: BorderRadius.circular(12),
             ),
             child: messages.isEmpty
-                ? const Center(
-                    child: Text('No messages yet'),
-                  )
+                ? const Center(child: Text('No messages yet'))
                 : ListView.builder(
                     controller: scrollController,
                     itemCount: messages.length,
@@ -561,12 +727,8 @@ class _HomeScreenState extends State<HomeScreen> {
                             ? Alignment.centerRight
                             : Alignment.centerLeft,
                         child: Container(
-                          constraints: const BoxConstraints(
-                            maxWidth: 260,
-                          ),
-                          margin: const EdgeInsets.symmetric(
-                            vertical: 4,
-                          ),
+                          constraints: const BoxConstraints(maxWidth: 260),
+                          margin: const EdgeInsets.symmetric(vertical: 4),
                           padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
                             color: message.isMine
@@ -601,9 +763,7 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(width: 8),
 
               IconButton.filled(
-                onPressed: isConnected && !sending
-                    ? sendMessage
-                    : null,
+                onPressed: isConnected && !sending ? sendMessage : null,
                 icon: const Icon(Icons.send),
               ),
             ],
