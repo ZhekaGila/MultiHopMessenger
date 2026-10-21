@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'database/database_helper.dart';
 import 'models/message.dart';
+import 'services/device_identity.dart';
 
 void main() {
   runApp(const MultiHopApp());
@@ -83,7 +84,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   bool sending = false;
 
-  String get localDeviceId => 'phone_a';
+  String localDeviceId = '';
 
   bool get isConnected => connectionStatus.startsWith('Connected:');
 
@@ -91,7 +92,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
 
-    loadMessagesFromDatabase();
+    initializeDeviceIdentity();
 
     eventSubscription = eventChannel
         .receiveBroadcastStream()
@@ -106,7 +107,6 @@ class _HomeScreenState extends State<HomeScreen> {
         );
   }
 
-
   void handleBluetoothEvent(dynamic event) {
     if (!mounted || event is! Map) return;
 
@@ -118,10 +118,22 @@ class _HomeScreenState extends State<HomeScreen> {
         connectionStatus = value;
       });
     } else if (type == 'message') {
+
       saveIncomingMessage(value);
+    
+      setState(() {
+        messages.add(
+          ChatMessage(
+            text: value,
+            isMine: false,
+            time: DateTime.now(),
+          ),
+        );
+      });
+
+      scrollToBottom();
     }
   }
-
 
   void scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -225,7 +237,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
 
-    if (text.isEmpty || !isConnected || sending) return;
+    if (text.isEmpty || !isConnected || sending || localDeviceId.isEmpty) return;
 
     setState(() {
       sending = true;
@@ -365,6 +377,25 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> initializeDeviceIdentity() async {
+    try {
+      final id = await DeviceIdentity.getOrCreateDeviceId();
+      if (!mounted) return;
+
+      setState(() {
+        localDeviceId = id;
+      });
+
+      await DatabaseHelper.instance.migrateLegacySenderId(id);
+      await loadMessagesFromDatabase();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        status = 'Device identity error: $e';
+      });
+    }
+  }
+
   @override
   void dispose() {
     eventSubscription?.cancel();
@@ -382,6 +413,9 @@ class _HomeScreenState extends State<HomeScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          const Text('My Device ID:', style: TextStyle(fontWeight: FontWeight.bold)),
+          SelectableText(localDeviceId.isEmpty ? 'Loading...' : localDeviceId),
+          const Divider(height: 30),
           const Icon(
             Icons.bluetooth,
             size: 55,
