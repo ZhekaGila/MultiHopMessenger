@@ -3,6 +3,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'database/database_helper.dart';
+import 'models/message.dart';
 
 void main() {
   runApp(const MultiHopApp());
@@ -81,11 +83,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
   bool sending = false;
 
+  String get localDeviceId => 'phone_a';
+
   bool get isConnected => connectionStatus.startsWith('Connected:');
 
   @override
   void initState() {
     super.initState();
+
+    loadMessagesFromDatabase();
 
     eventSubscription = eventChannel
         .receiveBroadcastStream()
@@ -100,6 +106,7 @@ class _HomeScreenState extends State<HomeScreen> {
         );
   }
 
+
   void handleBluetoothEvent(dynamic event) {
     if (!mounted || event is! Map) return;
 
@@ -111,19 +118,10 @@ class _HomeScreenState extends State<HomeScreen> {
         connectionStatus = value;
       });
     } else if (type == 'message') {
-      setState(() {
-        messages.add(
-          ChatMessage(
-            text: value,
-            isMine: false,
-            time: DateTime.now(),
-          ),
-        );
-      });
-
-      scrollToBottom();
+      saveIncomingMessage(value);
     }
   }
+
 
   void scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -242,6 +240,15 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
 
       if (result == 'Message sent') {
+
+        final savedMessage = Message.create(
+          senderId: localDeviceId,
+          receiverId: 'remote_device',
+          text: text,
+        ).copyWith(status: 'sent');
+
+        await DatabaseHelper.instance.insertMessage(savedMessage);
+
         setState(() {
           messages.add(
             ChatMessage(
@@ -273,6 +280,88 @@ class _HomeScreenState extends State<HomeScreen> {
           sending = false;
         });
       }
+    }
+  }
+
+  Future<void> testDatabase() async{
+    try{
+      final message = Message.create(
+        senderId: 'test_phone_a',
+        receiverId: 'test_phone_b',
+        text: 'Hello SQLite!',
+      );
+        
+      await DatabaseHelper.instance.insertMessage(message);
+
+      final savedMessages = await DatabaseHelper.instance.getAllMessages();
+
+      if (!mounted) return;
+
+      setState((){
+        status = 'SQLite works! Saved message: ' '${savedMessages.length}';
+      });
+    }catch (e){
+      if(!mounted) return;
+
+      setState((){
+        status = 'SQLite error: $e';
+      });
+    }
+  }
+
+  Future<void> loadMessagesFromDatabase() async{
+    try{
+      final savedMessages = await DatabaseHelper.instance.getAllMessages();
+
+      if (!mounted) return;
+
+      setState((){
+        messages = savedMessages.map((message){
+          return ChatMessage(
+            text: message.text,
+            isMine: message.senderId == localDeviceId,
+            time: message.createdAt,
+            );
+        }).toList();
+      });
+
+      scrollToBottom();
+    } catch (e) {
+      if(!mounted) return;
+
+      setState((){
+        status = 'Database error: $e';
+      });
+    }
+  }
+
+  Future<void> saveIncomingMessage(String text) async{
+    try{
+      final message = Message.create(
+        senderId: 'remote_device',
+        receiverId: localDeviceId,
+        text: text,
+      ).copyWith(status: 'received');
+
+      await DatabaseHelper.instance.insertMessage(message);
+
+      if (!mounted) return;
+
+      setState((){
+        messages.add(
+          ChatMessage(text: text,
+           isMine: false, 
+           time: message.createdAt,),
+        );
+      });
+
+      scrollToBottom();
+    }catch(e){
+      if(!mounted) return;
+
+      setState((){
+        status = 'Failed to save incoming message: $e';
+      });
     }
   }
 
@@ -395,6 +484,13 @@ class _HomeScreenState extends State<HomeScreen> {
               await refreshConnectionStatus();
             },
             child: const Text('Disconnect'),
+          ),
+
+          const SizedBox(height: 12),
+
+          ElevatedButton(
+            onPressed: testDatabase,
+            child: const Text('Test SQLite'),
           ),
 
           const Divider(height: 30),
