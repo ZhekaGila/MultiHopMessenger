@@ -125,6 +125,28 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> sendAck(String messageId) async {
+    if (!isConnected || peerDeviceId.isEmpty) {
+      return;
+    }
+
+    final ackPacket = {
+      'type': 'ack',
+      'messageId': messageId,
+      'deviceId': localDeviceId,
+    };
+
+    try {
+      await channel.invokeMethod<String>('sendMessage', {
+        'message': jsonEncode(ackPacket),
+      });
+
+      debugPrint('ACK sent for message: $messageId');
+    } catch (e) {
+      debugPrint('ACK send error: $e');
+    }
+  }
+
   Future<void> saveReceivedJsonMessage(Message message) async {
     try {
       final savedMessage = message.copyWith(status: 'received');
@@ -133,8 +155,11 @@ class _HomeScreenState extends State<HomeScreen> {
         savedMessage,
       );
 
+      await sendAck(message.id);
+
       if (!inserted) {
         debugPrint('Duplicate message ignored: ${message.id}');
+        return;
       }
 
       if (!mounted) return;
@@ -218,6 +243,17 @@ class _HomeScreenState extends State<HomeScreen> {
           });
 
           forwardMessagesToPeer();
+        }
+
+        return;
+      }
+
+      if (packetType == 'ack') {
+        final messageId = data['messageId'];
+        final senderDeviceId = data['deviceId'];
+
+        if (messageId is String && senderDeviceId is String) {
+          debugPrint('ACK received for $messageId from $senderDeviceId');
         }
 
         return;
@@ -524,6 +560,8 @@ class _HomeScreenState extends State<HomeScreen> {
       final inserted = await DatabaseHelper.instance.insertMessage(
         relayMessage,
       );
+
+      await sendAck(message.id);
 
       if (inserted) {
         debugPrint('Relay message saved: ${message.id}');

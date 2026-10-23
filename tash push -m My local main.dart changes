@@ -1,0 +1,73 @@
+warning: in the working copy of 'lib/main.dart', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/lib/main.dart b/lib/main.dart[m
+[1mindex 65fa63e..4be2f76 100644[m
+[1m--- a/lib/main.dart[m
+[1m+++ b/lib/main.dart[m
+[36m@@ -125,6 +125,28 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+     }[m
+   }[m
+ [m
+[32m+[m[32m  Future<void> sendAck(String messageId) async {[m
+[32m+[m[32m    if (!isConnected || peerDeviceId.isEmpty) {[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    final ackPacket = {[m
+[32m+[m[32m      'type': 'ack',[m
+[32m+[m[32m      'messageId': messageId,[m
+[32m+[m[32m      'deviceId': localDeviceId,[m
+[32m+[m[32m    };[m
+[32m+[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      await channel.invokeMethod<String>('sendMessage', {[m
+[32m+[m[32m        'message': jsonEncode(ackPacket),[m
+[32m+[m[32m      });[m
+[32m+[m
+[32m+[m[32m      debugPrint('ACK sent for message: $messageId');[m
+[32m+[m[32m    } catch (e) {[m
+[32m+[m[32m      debugPrint('ACK send error: $e');[m
+[32m+[m[32m    }[m
+[32m+[m[32m  }[m
+[32m+[m
+   Future<void> saveReceivedJsonMessage(Message message) async {[m
+     try {[m
+       final savedMessage = message.copyWith(status: 'received');[m
+[36m@@ -133,8 +155,11 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+         savedMessage,[m
+       );[m
+ [m
+[32m+[m[32m      await sendAck(message.id);[m
+[32m+[m
+       if (!inserted) {[m
+         debugPrint('Duplicate message ignored: ${message.id}');[m
+[32m+[m[32m        return;[m
+       }[m
+ [m
+       if (!mounted) return;[m
+[36m@@ -223,6 +248,17 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+         return;[m
+       }[m
+ [m
+[32m+[m[32m      if (packetType == 'ack') {[m
+[32m+[m[32m        final messageId = data['messageId'];[m
+[32m+[m[32m        final senderDeviceId = data['deviceId'];[m
+[32m+[m
+[32m+[m[32m        if (messageId is String && senderDeviceId is String) {[m
+[32m+[m[32m          debugPrint('ACK received for $messageId from $senderDeviceId');[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        return;[m
+[32m+[m[32m      }[m
+[32m+[m
+       if (packetType == 'chat') {[m
+         final message = Message.fromWireJson(raw);[m
+ [m
+[36m@@ -525,6 +561,8 @@[m [mclass _HomeScreenState extends State<HomeScreen> {[m
+         relayMessage,[m
+       );[m
+ [m
+[32m+[m[32m      await sendAck(message.id);[m
+[32m+[m
+       if (inserted) {[m
+         debugPrint('Relay message saved: ${message.id}');[m
+ [m
