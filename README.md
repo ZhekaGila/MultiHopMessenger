@@ -232,9 +232,8 @@ Individual contributions should be visible through identifiable commits and link
 ## 12. Project links
 
 - **Repository:** [https://github.com/ZhekaGila/MultiHopMessenger](https://github.com/ZhekaGila/MultiHopMessenger)
-- **YouTrack task example:** [https://zhandos.youtrack.cloud/issue/MHM-14/Conduct-Real-Device-Multi-Hop-Routing-Experiments](https://zhandos.youtrack.cloud/issue/MHM-14/Conduct-Real-Device-Multi-Hop-Routing-Experiments)
-- **Project report and supporting documentation:** To be linked here after files are added to the repository.
-- **Pre-defense submission tag:** To be linked after the team publishes the required checkpoint tag.
+- **YouTrack:** https://zhandos.youtrack.cloud/issues/MHM
+- **Project report and supporting documentation:** (https://docs.google.com/document/d/1gBlsgaA1NJ5KkB4WXQNb5HB0dLYVCp56/edit?usp=drive_link&ouid=100738354704833960248&rtpof=true&sd=true)
 
 ---
 
