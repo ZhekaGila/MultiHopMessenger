@@ -147,6 +147,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> handleAck(String messageId, String senderDeviceId) async {
+    if (!isConnected || senderDeviceId != peerDeviceId) {
+      debugPrint('ACK rejected: unexpected sender');
+      return;
+    }
+
+    final message = await DatabaseHelper.instance.getMessageById(messageId);
+
+    if (message == null) {
+      debugPrint('ACK ignored: unknown message $messageId');
+      return;
+    }
+
+    if (message.status == 'delivered') {
+      return;
+    }
+
+    if (message.receiverId == senderDeviceId) {
+      await DatabaseHelper.instance.updateMessageStatus(messageId, 'delivered');
+
+      debugPrint('Message delivered: $messageId');
+    } else {
+      await DatabaseHelper.instance.updateMessageStatus(messageId, 'forwarded');
+
+      debugPrint('Message forwarded to relay: $messageId');
+    }
+  }
+
   Future<void> saveReceivedJsonMessage(Message message) async {
     try {
       final savedMessage = message.copyWith(status: 'received');
@@ -253,7 +281,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final senderDeviceId = data['deviceId'];
 
         if (messageId is String && senderDeviceId is String) {
-          debugPrint('ACK received for $messageId from $senderDeviceId');
+          handleAck(messageId, senderDeviceId);
         }
 
         return;
