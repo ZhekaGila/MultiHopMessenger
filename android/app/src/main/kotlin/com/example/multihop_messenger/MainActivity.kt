@@ -19,12 +19,21 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.UUID
 
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.app.Activity
+
 class MainActivity : FlutterActivity() {
     private val methodChannelName = "multihop/bluetooth"
     private val eventChannelName = "multihop/bluetooth_events"
     private val permissionRequestCode = 1001
     private val serviceName = "MultiHopMessenger"
     private val serviceUUID = UUID.fromString("8b32a43c-7a5f-4a52-9a5e-6b80cde41f21")
+
+    private val discoveredDevices = mutableMapOf<String, Map<String, String>>()
+    private var discoveryReceiverRegistered = false
 
     private data class PeerConnection(
         val socket: BluetoothSocket,
@@ -39,6 +48,142 @@ class MainActivity : FlutterActivity() {
     @Volatile private var eventSink: EventChannel.EventSink? = null
     @Volatile private var connectionStatus = "Disconnected"
 
+
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    if (!hasConnectPermission()) return
+
+                    val device = if (Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(
+                            BluetoothDevice.EXTRA_DEVICE,
+                            BluetoothDevice::class.java
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra<BluetoothDevice>(
+                            BluetoothDevice.EXTRA_DEVICE
+                        )
+                    } ?: return
+
+                    val address = device.address
+                    val name = device.name ?: "Unknown device"
+
+                    val info = mapOf(
+                        "name" to name,
+                        "address" to address
+                    )
+
+                    discoveredDevices[address] = info
+
+                    runOnUiThread {
+                        eventSink?.success(
+                            mapOf(
+                                "type" to "deviceFound",
+                                "value" to info
+                            )
+                        )
+                    }
+                }
+
+                BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                    sendEvent("discoveryFinished", "Discovery finished")
+                }
+            }
+        }
+    }
+
+    private fun startDiscovery(): String {
+        if (!hasScanPermission() || !hasConnectPermission()) {
+            return "Bluetooth permissions required"
+        }
+
+        val adapter = bluetoothAdapter
+            ?: return "Bluetooth not supported"
+
+        if (!adapter.isEnabled) {
+            return "Bluetooth is OFF"
+        }
+
+        if (!discoveryReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(
+                    discoveryReceiver,
+                    filter,
+                    Context.RECEIVER_EXPORTED
+                )
+            } else {
+                registerReceiver(discoveryReceiver, filter)
+            }
+
+            discoveryReceiverRegistered = true
+        }
+
+        discoveredDevices.clear()
+
+        if (adapter.isDiscovering) {
+            adapter.cancelDiscovery()
+        }
+
+        return if (adapter.startDiscovery()) {
+            "Discovery started"
+        } else {
+            "Failed to start discovery"
+        }
+    }
+
+    private fun requestDiscoverable(): String {
+        if (!hasConnectPermission()) {
+            return "Bluetooth connect permission required"
+        }
+
+        val adapter = bluetoothAdapter
+            ?: return "Bluetooth not supported"
+
+        if (!adapter.isEnabled) {
+            return "Bluetooth is OFF"
+        }
+
+        val intent = Intent(
+            BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE
+        ).apply {
+            putExtra(
+                BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION,
+                300
+            )
+        }
+
+        return try {
+            startActivity(intent)
+            "Discoverability request started"
+        } catch (e: Exception) {
+            "Discoverability request failed: ${e.message}"
+        }
+    }
+        
+
+
+    private fun stopDiscovery(): String {
+        if (!hasScanPermission()) {
+            return "Bluetooth scan permission required"
+        }
+
+        val adapter = bluetoothAdapter
+            ?: return "Bluetooth not supported"
+
+        if (adapter.isDiscovering) {
+            adapter.cancelDiscovery()
+        }
+
+        return "Discovery stopped"
+    }
+
     private val bluetoothAdapter: BluetoothAdapter?
         get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
 
@@ -51,7 +196,7 @@ class MainActivity : FlutterActivity() {
     private fun requestBluetoothPermission() {
         if (Build.VERSION.SDK_INT >= 31) {
             requestPermissions(
-                arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN),
+                arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_ADVERTISE),
                 permissionRequestCode
             )
         }
@@ -260,6 +405,18 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, methodChannelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "startDiscovery" -> {
+                        result.success(startDiscovery())
+                    }
+                    "requestDiscoverable" -> {
+                        result.success(requestDiscoverable())
+                    }
+                    "stopDiscovery" -> {
+                        result.success(stopDiscovery())
+                    }
+                    "getDiscoveredDevices" -> {
+                        result.success(discoveredDevices.values.toList())
+                    }
                     "checkBluetooth" -> {
                         val adapter = bluetoothAdapter
                         result.success(when {
@@ -324,6 +481,10 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         disconnect()
         eventSink = null
+        if (discoveryReceiverRegistered) {
+            unregisterReceiver(discoveryReceiver)
+            discoveryReceiverRegistered = false
+        }
         super.onDestroy()
     }
 }
