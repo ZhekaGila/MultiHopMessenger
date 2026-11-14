@@ -244,7 +244,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
 
-        // Обновляем открытую переписку.
         if (selectedPeerId == savedMessage.senderId) {
           conversationMessages.add(savedMessage);
         }
@@ -627,6 +626,20 @@ class _HomeScreenState extends State<HomeScreen> {
     return null;
   }
 
+  String? findNextHopAddress(String destinationId) {
+    final directAddress = findAddressByDeviceId(destinationId);
+
+    if (directAddress != null) {
+      return directAddress;
+    }
+
+    if (connectedAddresses.length == 1) {
+      return connectedAddresses.first;
+    }
+
+    return null;
+  }
+
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
 
@@ -826,6 +839,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> saveRelayMessage(Message message, String senderAddress) async {
     try {
+      if (message.hopCount >= maxHopCount) {
+        debugPrint('Hop limit reached: ${message.id}');
+        return;
+      }
+
       final relayMessage = message.copyWith(status: 'pending');
 
       final inserted = await DatabaseHelper.instance.insertMessage(
@@ -834,17 +852,40 @@ class _HomeScreenState extends State<HomeScreen> {
 
       await sendAck(message.id, senderAddress);
 
-      if (inserted) {
-        debugPrint('Relay message saved: ${message.id}');
+      if (!inserted) {
+        debugPrint('Duplicate relay message: ${message.id}');
+        return;
+      }
 
-        debugPrint('Destination: ${message.receiverId}');
+      debugPrint('Relay message saved: ${message.id}');
+      debugPrint('Destination: ${message.receiverId}');
 
-        debugPrint('Hop count: ${message.hopCount}');
+      final destinationAddress = findAddressByDeviceId(message.receiverId);
+
+      if (destinationAddress == null) {
+        debugPrint('Destination is not connected. Message stored.');
+        return;
+      }
+
+      if (destinationAddress == senderAddress) {
+        debugPrint('Skipping sender to prevent routing loop');
+        return;
+      }
+
+      final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
+
+      final success = await sendPacketToDevice(
+        destinationAddress,
+        forwardedMessage.toWireJson(),
+      );
+
+      if (success) {
+        debugPrint('Message ${message.id} forwarded to ${message.receiverId}');
       } else {
-        debugPrint('Duplicate relay message ignored: ${message.id}');
+        debugPrint('Forwarding failed: ${message.id}');
       }
     } catch (e) {
-      debugPrint('Relay save error: $e');
+      debugPrint('Relay error: $e');
     }
   }
 
@@ -914,14 +955,16 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final address = findAddressByDeviceId(peerId);
+    final nextHopAddress = findNextHopAddress(peerId);
 
-    if (address == null) {
+    if (nextHopAddress == null) {
       setState(() {
-        status = 'Device is not directly connected';
+        status = 'No available route to destination';
       });
       return;
     }
+
+    final isDirectConnection = findAddressByDeviceId(peerId) != null;
 
     setState(() {
       sending = true;
@@ -934,7 +977,10 @@ class _HomeScreenState extends State<HomeScreen> {
         text: text,
       );
 
-      final success = await sendPacketToDevice(address, message.toWireJson());
+      final success = await sendPacketToDevice(
+        nextHopAddress,
+        message.toWireJson(),
+      );
 
       if (!mounted) return;
 
@@ -951,7 +997,9 @@ class _HomeScreenState extends State<HomeScreen> {
             messageController.clear();
           }
 
-          status = 'Message sent';
+          status = isDirectConnection
+              ? 'Message sent directly'
+              : 'Message sent to relay';
         });
 
         await loadConversations();
@@ -1067,7 +1115,7 @@ class _HomeScreenState extends State<HomeScreen> {
               Expanded(
                 child: TextField(
                   controller: messageController,
-                  enabled: !sending && findAddressByDeviceId(peerId) != null,
+                  enabled: !sending && findNextHopAddress(peerId) != null,
                   textInputAction: TextInputAction.send,
                   onSubmitted: (_) => sendConversationMessage(),
                   decoration: const InputDecoration(
@@ -1078,7 +1126,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(width: 8),
               IconButton.filled(
-                onPressed: sending || findAddressByDeviceId(peerId) == null
+                onPressed: sending || findNextHopAddress(peerId) == null
                     ? null
                     : sendConversationMessage,
                 icon: const Icon(Icons.send),
@@ -1088,6 +1136,61 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ],
     );
+  }
+
+  Future<void> showNewChatDialog() async {
+    final availablePeers = peerIdsByAddress.entries
+        .where(
+          (entry) =>
+              connectedAddresses.contains(entry.key) && entry.value.isNotEmpty,
+        )
+        .toList();
+
+    final peerId = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('New Chat'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: availablePeers.isEmpty
+                ? const Text(
+                    'No connected devices found. '
+                    'Connect a device in the Devices tab first.',
+                  )
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: availablePeers.length,
+                    itemBuilder: (context, index) {
+                      final peer = availablePeers[index];
+                      final deviceId = peer.value;
+
+                      return ListTile(
+                        leading: const Icon(Icons.bluetooth_connected),
+                        title: Text('Device ${deviceId.substring(0, 8)}'),
+                        subtitle: Text(peer.key),
+                        onTap: () {
+                          Navigator.pop(dialogContext, deviceId);
+                        },
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(dialogContext);
+              },
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || peerId == null) return;
+
+    await openConversation(peerId);
   }
 
   Widget buildChatsTab() {
@@ -1168,7 +1271,17 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('MultiHop Messenger')),
+      appBar: AppBar(
+        title: const Text('MultiHop Messenger'),
+        actions: [
+          if (selectedTab == 0 && selectedPeerId == null)
+            IconButton(
+              icon: const Icon(Icons.add_comment_outlined),
+              tooltip: 'New Chat',
+              onPressed: showNewChatDialog,
+            ),
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: selectedTab,
         onDestinationSelected: (index) {
