@@ -100,6 +100,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final Map<String, String> peerIdsByAddress = {};
 
+  final Map<String, String> reachablePeers = {};
+
   static const int maxHopCount = 5;
 
   bool get isConnected => connectedAddresses.isNotEmpty;
@@ -139,6 +141,32 @@ class _HomeScreenState extends State<HomeScreen> {
     } on PlatformException catch (e) {
       debugPrint('Bluetooth send error: ${e.message}');
       return false;
+    }
+  }
+
+  Future<void> sendPeers(String address) async {
+    if (!connectedAddresses.contains(address) || localDeviceId.isEmpty) {
+      return;
+    }
+
+    final peers = peerIdsByAddress.entries
+        .where(
+          (entry) =>
+              connectedAddresses.contains(entry.key) &&
+              entry.key != address &&
+              entry.value.isNotEmpty,
+        )
+        .map((entry) => entry.value)
+        .toList();
+
+    final packet = {'type': 'peers', 'deviceId': localDeviceId, 'peers': peers};
+
+    final success = await sendPacketToDevice(address, jsonEncode(packet));
+
+    if (success) {
+      debugPrint('PEERS sent to $address: $peers');
+    } else {
+      debugPrint('PEERS failed for $address');
     }
   }
 
@@ -313,6 +341,43 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final packetType = data['type'];
 
+      if (packetType == 'peers') {
+        final senderDeviceId = data['deviceId'];
+        final receivedPeers = data['peers'];
+
+        if (!connectedAddresses.contains(senderAddress) ||
+            senderDeviceId is! String ||
+            peerIdsByAddress[senderAddress] != senderDeviceId ||
+            receivedPeers is! List) {
+          debugPrint('Invalid PEERS packet');
+          return;
+        }
+
+        final peerIds = receivedPeers
+            .whereType<String>()
+            .where(
+              (id) =>
+                  id.isNotEmpty && id != localDeviceId && id != senderDeviceId,
+            )
+            .toSet();
+
+        setState(() {
+          reachablePeers.removeWhere(
+            (deviceId, nextHopAddress) => nextHopAddress == senderAddress,
+          );
+
+          for (final peerId in peerIds) {
+            if (findAddressByDeviceId(peerId) == null) {
+              reachablePeers[peerId] = senderAddress;
+            }
+          }
+        });
+
+        debugPrint('Reachable peers via $senderAddress: $peerIds');
+
+        return;
+      }
+
       if (packetType == 'hello') {
         final receivedDeviceId = data['deviceId'];
 
@@ -325,6 +390,14 @@ class _HomeScreenState extends State<HomeScreen> {
           });
 
           forwardMessagesToPeer(senderAddress);
+
+          sendPeers(senderAddress);
+
+          for (final address in connectedAddresses) {
+            if (address != senderAddress) {
+              sendPeers(address);
+            }
+          }
         }
 
         return;
@@ -414,6 +487,10 @@ class _HomeScreenState extends State<HomeScreen> {
       if (address.isNotEmpty) {
         setState(() {
           peerIdsByAddress.remove(address);
+
+          reachablePeers.removeWhere(
+            (deviceId, nextHopAddress) => nextHopAddress == address,
+          );
         });
       }
 
@@ -633,8 +710,10 @@ class _HomeScreenState extends State<HomeScreen> {
       return directAddress;
     }
 
-    if (connectedAddresses.length == 1) {
-      return connectedAddresses.first;
+    final relayAddress = reachablePeers[destinationId];
+
+    if (relayAddress != null && connectedAddresses.contains(relayAddress)) {
+      return relayAddress;
     }
 
     return null;
@@ -1139,10 +1218,18 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> showNewChatDialog() async {
-    final availablePeers = peerIdsByAddress.entries
+    final directPeers = peerIdsByAddress.entries
         .where(
           (entry) =>
               connectedAddresses.contains(entry.key) && entry.value.isNotEmpty,
+        )
+        .toList();
+
+    final indirectPeers = reachablePeers.entries
+        .where(
+          (entry) =>
+              connectedAddresses.contains(entry.value) &&
+              findAddressByDeviceId(entry.key) == null,
         )
         .toList();
 
@@ -1153,34 +1240,57 @@ class _HomeScreenState extends State<HomeScreen> {
           title: const Text('New Chat'),
           content: SizedBox(
             width: double.maxFinite,
-            child: availablePeers.isEmpty
-                ? const Text(
-                    'No connected devices found. '
-                    'Connect a device in the Devices tab first.',
-                  )
-                : ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: availablePeers.length,
-                    itemBuilder: (context, index) {
-                      final peer = availablePeers[index];
-                      final deviceId = peer.value;
-
-                      return ListTile(
-                        leading: const Icon(Icons.bluetooth_connected),
-                        title: Text('Device ${deviceId.substring(0, 8)}'),
-                        subtitle: Text(peer.key),
-                        onTap: () {
-                          Navigator.pop(dialogContext, deviceId);
-                        },
-                      );
-                    },
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                if (directPeers.isNotEmpty) ...[
+                  const Text(
+                    'Direct connections',
+                    style: TextStyle(fontWeight: FontWeight.bold),
                   ),
+                  for (final peer in directPeers)
+                    ListTile(
+                      leading: const Icon(Icons.bluetooth_connected),
+                      title: Text('Device ${peer.value.substring(0, 8)}'),
+                      subtitle: const Text('Direct connection'),
+                      onTap: () {
+                        Navigator.pop(dialogContext, peer.value);
+                      },
+                    ),
+                ],
+
+                if (indirectPeers.isNotEmpty) ...[
+                  const Divider(),
+                  const Text(
+                    'Available through relay',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  for (final peer in indirectPeers)
+                    ListTile(
+                      leading: const Icon(Icons.route),
+                      title: Text('Device ${peer.key.substring(0, 8)}'),
+                      subtitle: Text(
+                        'Via ${peerIdsByAddress[peer.value] ?? peer.value}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      onTap: () {
+                        Navigator.pop(dialogContext, peer.key);
+                      },
+                    ),
+                ],
+
+                if (directPeers.isEmpty && indirectPeers.isEmpty)
+                  const Text(
+                    'No devices discovered. '
+                    'Connect nearby devices first.',
+                  ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.pop(dialogContext);
-              },
+              onPressed: () => Navigator.pop(dialogContext),
               child: const Text('Cancel'),
             ),
           ],
