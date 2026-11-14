@@ -84,6 +84,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
   bool sending = false;
 
+  int selectedTab = 0;
+
+  List<String> conversationPeerIds = [];
+
+  String? selectedPeerId;
+
+  List<Message> conversationMessages = [];
+
+  bool loadingMessages = false;
+
+  bool loadingConversations = false;
+
   String localDeviceId = '';
 
   final Map<String, String> peerIdsByAddress = {};
@@ -231,9 +243,16 @@ class _HomeScreenState extends State<HomeScreen> {
             time: savedMessage.createdAt,
           ),
         );
+
+        // Обновляем открытую переписку.
+        if (selectedPeerId == savedMessage.senderId) {
+          conversationMessages.add(savedMessage);
+        }
       });
 
       scrollToBottom();
+
+      await loadConversations();
     } catch (e) {
       if (!mounted) return;
 
@@ -716,6 +735,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> loadConversations() async {
+    if (localDeviceId.isEmpty) return;
+
+    setState(() {
+      loadingConversations = true;
+    });
+
+    try {
+      final peerIds = await DatabaseHelper.instance.getConversationPeerIds(
+        localDeviceId,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        conversationPeerIds = peerIds;
+        loadingConversations = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        loadingConversations = false;
+        status = 'Failed to load conversations: $e';
+      });
+    }
+  }
+
   Future<void> loadMessagesFromDatabase() async {
     try {
       final savedMessages = await DatabaseHelper.instance.getAllMessages();
@@ -813,6 +860,8 @@ class _HomeScreenState extends State<HomeScreen> {
       await DatabaseHelper.instance.migrateLegacySenderId(id);
       await loadMessagesFromDatabase();
 
+      await loadConversations();
+
       if (isConnected) {
         for (final address in connectedAddresses) {
           await sendHello(address);
@@ -824,6 +873,287 @@ class _HomeScreenState extends State<HomeScreen> {
         status = 'Device identity error: $e';
       });
     }
+  }
+
+  Future<void> openConversation(String peerId) async {
+    messageController.clear();
+
+    setState(() {
+      selectedPeerId = peerId;
+      conversationMessages = [];
+      loadingMessages = true;
+    });
+
+    try {
+      final savedMessages = await DatabaseHelper.instance.getConversation(
+        localDeviceId,
+        peerId,
+      );
+
+      if (!mounted || selectedPeerId != peerId) return;
+
+      setState(() {
+        conversationMessages = savedMessages;
+        loadingMessages = false;
+      });
+    } catch (e) {
+      if (!mounted || selectedPeerId != peerId) return;
+
+      setState(() {
+        loadingMessages = false;
+        status = 'Failed to load conversation: $e';
+      });
+    }
+  }
+
+  Future<void> sendConversationMessage() async {
+    final peerId = selectedPeerId;
+    final text = messageController.text.trim();
+
+    if (peerId == null || text.isEmpty || sending || localDeviceId.isEmpty) {
+      return;
+    }
+
+    final address = findAddressByDeviceId(peerId);
+
+    if (address == null) {
+      setState(() {
+        status = 'Device is not directly connected';
+      });
+      return;
+    }
+
+    setState(() {
+      sending = true;
+    });
+
+    try {
+      final message = Message.create(
+        senderId: localDeviceId,
+        receiverId: peerId,
+        text: text,
+      );
+
+      final success = await sendPacketToDevice(address, message.toWireJson());
+
+      if (!mounted) return;
+
+      if (success) {
+        final savedMessage = message.copyWith(status: 'sent');
+
+        await DatabaseHelper.instance.insertMessage(savedMessage);
+
+        if (!mounted) return;
+
+        setState(() {
+          if (selectedPeerId == peerId) {
+            conversationMessages.add(savedMessage);
+            messageController.clear();
+          }
+
+          status = 'Message sent';
+        });
+
+        await loadConversations();
+      } else {
+        setState(() {
+          status = 'Failed to send message';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Send error: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          sending = false;
+        });
+      }
+    }
+  }
+
+  Widget buildConversationTab() {
+    final peerId = selectedPeerId;
+
+    if (peerId == null) {
+      return buildChatsTab();
+    }
+
+    if (loadingMessages) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Column(
+      children: [
+        ListTile(
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () {
+              setState(() {
+                selectedPeerId = null;
+                conversationMessages = [];
+              });
+
+              loadConversations();
+            },
+          ),
+          title: Text('Device ${peerId.substring(0, 8)}'),
+          subtitle: Text(
+            connectedAddresses.any(
+                  (address) => peerIdsByAddress[address] == peerId,
+                )
+                ? 'Connected'
+                : 'Offline',
+          ),
+        ),
+
+        const Divider(height: 1),
+
+        Expanded(
+          child: conversationMessages.isEmpty
+              ? const Center(child: Text('No messages yet'))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: conversationMessages.length,
+                  itemBuilder: (context, index) {
+                    final message = conversationMessages[index];
+
+                    final isMine = message.senderId == localDeviceId;
+
+                    return Align(
+                      alignment: isMine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 280),
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: isMine
+                              ? Colors.blue.shade100
+                              : Colors.grey.shade200,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(message.text),
+
+                            const SizedBox(height: 4),
+
+                            Text(
+                              '${message.createdAt.toLocal().hour.toString().padLeft(2, '0')}:'
+                              '${message.createdAt.toLocal().minute.toString().padLeft(2, '0')}',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.black54,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: messageController,
+                  enabled: !sending && findAddressByDeviceId(peerId) != null,
+                  textInputAction: TextInputAction.send,
+                  onSubmitted: (_) => sendConversationMessage(),
+                  decoration: const InputDecoration(
+                    hintText: 'Type a message...',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                onPressed: sending || findAddressByDeviceId(peerId) == null
+                    ? null
+                    : sendConversationMessage,
+                icon: const Icon(Icons.send),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget buildChatsTab() {
+    if (loadingConversations) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (conversationPeerIds.isEmpty) {
+      return const Center(child: Text('No conversations yet'));
+    }
+
+    return ListView.builder(
+      itemCount: conversationPeerIds.length,
+      itemBuilder: (context, index) {
+        final peerId = conversationPeerIds[index];
+
+        return FutureBuilder<Message?>(
+          future: DatabaseHelper.instance.getLastConversationMessage(
+            localDeviceId,
+            peerId,
+          ),
+          builder: (context, snapshot) {
+            final lastMessage = snapshot.data;
+
+            String subtitle = 'No messages yet';
+            String time = '';
+
+            if (lastMessage != null) {
+              final isMine = lastMessage.senderId == localDeviceId;
+
+              subtitle = isMine ? 'You: ${lastMessage.text}' : lastMessage.text;
+
+              final localTime = lastMessage.createdAt.toLocal();
+
+              time =
+                  '${localTime.hour.toString().padLeft(2, '0')}:'
+                  '${localTime.minute.toString().padLeft(2, '0')}';
+            }
+
+            return ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.person)),
+              title: Text('Device ${peerId.substring(0, 8)}'),
+              subtitle: Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    time,
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const Icon(Icons.chevron_right),
+                ],
+              ),
+              onTap: () {
+                openConversation(peerId);
+              },
+            );
+          },
+        );
+      },
+    );
   }
 
   @override
@@ -839,280 +1169,310 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('MultiHop Messenger')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          const Text(
-            'My Device ID:',
-            style: TextStyle(fontWeight: FontWeight.bold),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: selectedTab,
+        onDestinationSelected: (index) {
+          setState(() {
+            selectedTab = index;
+          });
+
+          if (index == 0) {
+            loadConversations();
+          }
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.chat_bubble_outline),
+            selectedIcon: Icon(Icons.chat_bubble),
+            label: 'Chats',
           ),
-
-          const SizedBox(height: 12),
-
-          TextField(
-            controller: receiverController,
-            decoration: const InputDecoration(
-              labelText: 'Destination UUID',
-              hintText: 'Enter receiver device UUID',
-              border: OutlineInputBorder(),
-            ),
-          ),
-
-          const SizedBox(height: 8),
-
-          SelectableText(localDeviceId.isEmpty ? 'Loading...' : localDeviceId),
-          const SizedBox(height: 8),
-          const Text(
-            'Connected Peer UUID:',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-
-          if (peerIdsByAddress.isEmpty)
-            const Text('No peer UUIDs received yet'),
-
-          for (final entry in peerIdsByAddress.entries)
-            ListTile(
-              dense: true,
-              title: SelectableText(entry.value),
-              subtitle: Text('Bluetooth: ${entry.key}'),
-            ),
-
-          const Divider(height: 30),
-          const Icon(Icons.bluetooth, size: 55, color: Colors.blue),
-
-          const SizedBox(height: 8),
-
-          Text(status, textAlign: TextAlign.center),
-
-          const SizedBox(height: 12),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('checkBluetooth'),
-            child: const Text('Check Bluetooth'),
-          ),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('requestBluetoothPermission'),
-            child: const Text('Request Bluetooth Permission'),
-          ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Bluetooth Server',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('startServer'),
-            child: const Text('Start Server'),
-          ),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('stopServer'),
-            child: const Text('Stop Server'),
-          ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Nearby Bluetooth Devices',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 12),
-
-          ElevatedButton.icon(
-            onPressed: isScanning ? null : scanNearbyDevices,
-            icon: const Icon(Icons.bluetooth_searching),
-            label: Text(isScanning ? 'Scanning...' : 'Scan Nearby'),
-          ),
-
-          ElevatedButton.icon(
-            onPressed: () => callKotlin('requestDiscoverable'),
-            icon: const Icon(Icons.visibility),
-            label: const Text('Make My Device Visible'),
-          ),
-
-          const SizedBox(height: 12),
-
-          for (final device in discoveredDevices)
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.smartphone),
-                title: Text(device.name),
-                subtitle: Text(device.address),
-                trailing: IconButton(
-                  icon: const Icon(Icons.link),
-                  onPressed: () => connectToDevice(device.address),
+          NavigationDestination(icon: Icon(Icons.bluetooth), label: 'Devices'),
+        ],
+      ),
+      body: selectedTab == 0
+          ? (selectedPeerId == null ? buildChatsTab() : buildConversationTab())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                const Text(
+                  'My Device ID:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-              ),
-            ),
 
-          const Divider(height: 30),
+                const SizedBox(height: 12),
 
-          const Text(
-            'Bluetooth Client',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          ElevatedButton(
-            onPressed: loadPairedDevices,
-            child: const Text('Show Paired Devices'),
-          ),
-
-          for (final device in pairedDevices)
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.smartphone),
-                title: Text(device.name),
-                subtitle: Text(device.address),
-                trailing: IconButton(
-                  icon: const Icon(Icons.link),
-                  onPressed: () => connectToDevice(device.address),
-                ),
-              ),
-            ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Connected Devices',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 12),
-
-          if (connectedAddresses.isEmpty) const Text('No connected devices'),
-
-          for (final address in connectedAddresses)
-            Card(
-              child: ListTile(
-                leading: const Icon(
-                  Icons.bluetooth_connected,
-                  color: Colors.green,
-                ),
-                title: Text(address, style: const TextStyle(fontSize: 14)),
-                subtitle: const Text('Connected'),
-                trailing: IconButton(
-                  icon: const Icon(Icons.link_off),
-                  tooltip: 'Disconnect',
-                  onPressed: () => disconnectFromDevice(address),
-                ),
-              ),
-            ),
-
-          const SizedBox(height: 12),
-
-          const Text(
-            'Connection Status',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 8),
-
-          Text(connectionStatus, textAlign: TextAlign.center),
-
-          ElevatedButton(
-            onPressed: refreshConnectionStatus,
-            child: const Text('Refresh Connection Status'),
-          ),
-
-          ElevatedButton(
-            onPressed: () async {
-              await callKotlin('disconnect');
-              await loadConnectedDevices();
-
-              if (!mounted) return;
-
-              setState(() {
-                peerIdsByAddress.clear();
-              });
-            },
-            child: const Text('Disconnect'),
-          ),
-
-          const SizedBox(height: 12),
-
-          ElevatedButton(
-            onPressed: testDatabase,
-            child: const Text('Test SQLite'),
-          ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Bluetooth Chat',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 12),
-
-          Container(
-            height: 260,
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.grey.shade300),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: messages.isEmpty
-                ? const Center(child: Text('No messages yet'))
-                : ListView.builder(
-                    controller: scrollController,
-                    itemCount: messages.length,
-                    itemBuilder: (context, index) {
-                      final message = messages[index];
-
-                      return Align(
-                        alignment: message.isMine
-                            ? Alignment.centerRight
-                            : Alignment.centerLeft,
-                        child: Container(
-                          constraints: const BoxConstraints(maxWidth: 260),
-                          margin: const EdgeInsets.symmetric(vertical: 4),
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: message.isMine
-                                ? Colors.blue.shade100
-                                : Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Text(message.text),
-                        ),
-                      );
-                    },
-                  ),
-          ),
-
-          const SizedBox(height: 12),
-
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: messageController,
-                  enabled: isConnected,
-                  textInputAction: TextInputAction.send,
-                  onSubmitted: (_) => sendMessage(),
+                TextField(
+                  controller: receiverController,
                   decoration: const InputDecoration(
-                    hintText: 'Type a message...',
+                    labelText: 'Destination UUID',
+                    hintText: 'Enter receiver device UUID',
                     border: OutlineInputBorder(),
                   ),
                 ),
-              ),
 
-              const SizedBox(width: 8),
+                const SizedBox(height: 8),
 
-              IconButton.filled(
-                onPressed: isConnected && !sending ? sendMessage : null,
-                icon: const Icon(Icons.send),
-              ),
-            ],
-          ),
+                SelectableText(
+                  localDeviceId.isEmpty ? 'Loading...' : localDeviceId,
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Connected Peer UUID:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
 
-          const SizedBox(height: 20),
-        ],
-      ),
+                if (peerIdsByAddress.isEmpty)
+                  const Text('No peer UUIDs received yet'),
+
+                for (final entry in peerIdsByAddress.entries)
+                  ListTile(
+                    dense: true,
+                    title: SelectableText(entry.value),
+                    subtitle: Text('Bluetooth: ${entry.key}'),
+                  ),
+
+                const Divider(height: 30),
+                const Icon(Icons.bluetooth, size: 55, color: Colors.blue),
+
+                const SizedBox(height: 8),
+
+                Text(status, textAlign: TextAlign.center),
+
+                const SizedBox(height: 12),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('checkBluetooth'),
+                  child: const Text('Check Bluetooth'),
+                ),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('requestBluetoothPermission'),
+                  child: const Text('Request Bluetooth Permission'),
+                ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Bluetooth Server',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('startServer'),
+                  child: const Text('Start Server'),
+                ),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('stopServer'),
+                  child: const Text('Stop Server'),
+                ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Nearby Bluetooth Devices',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 12),
+
+                ElevatedButton.icon(
+                  onPressed: isScanning ? null : scanNearbyDevices,
+                  icon: const Icon(Icons.bluetooth_searching),
+                  label: Text(isScanning ? 'Scanning...' : 'Scan Nearby'),
+                ),
+
+                ElevatedButton.icon(
+                  onPressed: () => callKotlin('requestDiscoverable'),
+                  icon: const Icon(Icons.visibility),
+                  label: const Text('Make My Device Visible'),
+                ),
+
+                const SizedBox(height: 12),
+
+                for (final device in discoveredDevices)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.smartphone),
+                      title: Text(device.name),
+                      subtitle: Text(device.address),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.link),
+                        onPressed: () => connectToDevice(device.address),
+                      ),
+                    ),
+                  ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Bluetooth Client',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                ElevatedButton(
+                  onPressed: loadPairedDevices,
+                  child: const Text('Show Paired Devices'),
+                ),
+
+                for (final device in pairedDevices)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.smartphone),
+                      title: Text(device.name),
+                      subtitle: Text(device.address),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.link),
+                        onPressed: () => connectToDevice(device.address),
+                      ),
+                    ),
+                  ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Connected Devices',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 12),
+
+                if (connectedAddresses.isEmpty)
+                  const Text('No connected devices'),
+
+                for (final address in connectedAddresses)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(
+                        Icons.bluetooth_connected,
+                        color: Colors.green,
+                      ),
+                      title: Text(
+                        address,
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                      subtitle: const Text('Connected'),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.link_off),
+                        tooltip: 'Disconnect',
+                        onPressed: () => disconnectFromDevice(address),
+                      ),
+                    ),
+                  ),
+
+                const SizedBox(height: 12),
+
+                const Text(
+                  'Connection Status',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 8),
+
+                Text(connectionStatus, textAlign: TextAlign.center),
+
+                ElevatedButton(
+                  onPressed: refreshConnectionStatus,
+                  child: const Text('Refresh Connection Status'),
+                ),
+
+                ElevatedButton(
+                  onPressed: () async {
+                    await callKotlin('disconnect');
+                    await loadConnectedDevices();
+
+                    if (!mounted) return;
+
+                    setState(() {
+                      peerIdsByAddress.clear();
+                    });
+                  },
+                  child: const Text('Disconnect'),
+                ),
+
+                const SizedBox(height: 12),
+
+                ElevatedButton(
+                  onPressed: testDatabase,
+                  child: const Text('Test SQLite'),
+                ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Bluetooth Chat',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 12),
+
+                Container(
+                  height: 260,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade300),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: messages.isEmpty
+                      ? const Center(child: Text('No messages yet'))
+                      : ListView.builder(
+                          controller: scrollController,
+                          itemCount: messages.length,
+                          itemBuilder: (context, index) {
+                            final message = messages[index];
+
+                            return Align(
+                              alignment: message.isMine
+                                  ? Alignment.centerRight
+                                  : Alignment.centerLeft,
+                              child: Container(
+                                constraints: const BoxConstraints(
+                                  maxWidth: 260,
+                                ),
+                                margin: const EdgeInsets.symmetric(vertical: 4),
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: message.isMine
+                                      ? Colors.blue.shade100
+                                      : Colors.grey.shade200,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(message.text),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+
+                const SizedBox(height: 12),
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: messageController,
+                        enabled: isConnected,
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => sendMessage(),
+                        decoration: const InputDecoration(
+                          hintText: 'Type a message...',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(width: 8),
+
+                    IconButton.filled(
+                      onPressed: isConnected && !sending ? sendMessage : null,
+                      icon: const Icon(Icons.send),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 20),
+              ],
+            ),
     );
   }
 }

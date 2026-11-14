@@ -89,12 +89,96 @@ class DatabaseHelper {
 
     final maps = await db.query(
       'messages',
-      where: 'receiver_id = ?',
-      whereArgs: [receiverId],
+      where: 'receiver_id = ? AND status = ?',
+      whereArgs: [receiverId, 'pending'],
       orderBy: 'created_at ASC',
     );
 
     return maps.map((map) => Message.fromMap(map)).toList();
+  }
+
+  Future<List<Message>> getConversation(
+    String localDeviceId,
+    String peerDeviceId,
+  ) async {
+    final db = await database;
+
+    final rows = await db.query(
+      'messages',
+      where: '''
+        (sender_id = ? AND receiver_id = ?)
+        OR
+        (sender_id = ? AND receiver_id = ?)
+      ''',
+      whereArgs: [localDeviceId, peerDeviceId, peerDeviceId, localDeviceId],
+      orderBy: 'created_at ASC',
+    );
+
+    return rows.map(Message.fromMap).toList();
+  }
+
+  Future<List<String>> getConversationPeerIds(String localDeviceId) async {
+    final db = await database;
+
+    final rows = await db.rawQuery(
+      '''
+      SELECT DISTINCT
+        CASE
+          WHEN sender_id = ? THEN receiver_id
+          ELSE sender_id
+        END AS peer_id
+      FROM messages
+      WHERE sender_id = ? OR receiver_id = ?
+      ''',
+      [localDeviceId, localDeviceId, localDeviceId],
+    );
+
+    return rows
+        .map((row) => row['peer_id'] as String)
+        .where((id) => id.isNotEmpty && id != localDeviceId)
+        .toList();
+  }
+
+  Future<Message?> getLastConversationMessage(
+    String localDeviceId,
+    String peerDeviceId,
+  ) async {
+    final db = await database;
+
+    final rows = await db.query(
+      'messages',
+      where: '''
+        (sender_id = ? AND receiver_id = ?)
+        OR
+        (sender_id = ? AND receiver_id = ?)
+      ''',
+      whereArgs: [localDeviceId, peerDeviceId, peerDeviceId, localDeviceId],
+      orderBy: 'created_at DESC',
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+
+    return Message.fromMap(rows.first);
+  }
+
+  Future<Message?> getMessageById(String messageId) async {
+    final db = await database;
+
+    final maps = await db.query(
+      'messages',
+      where: 'id = ?',
+      whereArgs: [messageId],
+      limit: 1,
+    );
+
+    if (maps.isEmpty) {
+      return null;
+    }
+
+    return Message.fromMap(maps.first);
   }
 
   Future<void> migrateLegacySenderId(String deviceId) async {
