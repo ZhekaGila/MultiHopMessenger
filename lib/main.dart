@@ -74,23 +74,31 @@ class _HomeScreenState extends State<HomeScreen> {
   String connectionStatus = 'Disconnected';
 
   List<BluetoothDeviceInfo> pairedDevices = [];
+  List<BluetoothDeviceInfo> discoveredDevices = [];
+
+  List<String> connectedAddresses = [];
+
+  bool isScanning = false;
+
   List<ChatMessage> messages = [];
 
   bool sending = false;
 
   String localDeviceId = '';
 
-  String peerDeviceId = '';
+  final Map<String, String> peerIdsByAddress = {};
 
   static const int maxHopCount = 5;
 
-  bool get isConnected => connectionStatus.startsWith('Connected:');
+  bool get isConnected => connectedAddresses.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
 
     initializeDeviceIdentity();
+
+    loadConnectedDevices();
 
     eventSubscription = eventChannel.receiveBroadcastStream().listen(
       handleBluetoothEvent,
@@ -103,30 +111,41 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> sendHello() async {
-    if (!isConnected || localDeviceId.isEmpty) {
+  Future<bool> sendPacketToDevice(String address, String packet) async {
+    if (!connectedAddresses.contains(address)) {
+      debugPrint('Device not connected: $address');
+      return false;
+    }
+
+    try {
+      final result = await channel.invokeMethod<String>('sendMessageToDevice', {
+        'address': address,
+        'message': packet,
+      });
+
+      return result == 'Message sent';
+    } on PlatformException catch (e) {
+      debugPrint('Bluetooth send error: ${e.message}');
+      return false;
+    }
+  }
+
+  Future<void> sendHello(String address) async {
+    if (!connectedAddresses.contains(address) || localDeviceId.isEmpty) {
       return;
     }
 
     final helloPacket = {'type': 'hello', 'deviceId': localDeviceId};
 
-    final jsonString = jsonEncode(helloPacket);
+    final success = await sendPacketToDevice(address, jsonEncode(helloPacket));
 
-    try {
-      await channel.invokeMethod<String>('sendMessage', {
-        'message': jsonString,
-      });
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        status = 'Hello error: $e';
-      });
+    if (!success) {
+      debugPrint('HELLO failed for $address');
     }
   }
 
-  Future<void> sendAck(String messageId) async {
-    if (!isConnected || peerDeviceId.isEmpty) {
+  Future<void> sendAck(String messageId, String senderAddress) async {
+    if (!connectedAddresses.contains(senderAddress) || localDeviceId.isEmpty) {
       return;
     }
 
@@ -136,19 +155,28 @@ class _HomeScreenState extends State<HomeScreen> {
       'deviceId': localDeviceId,
     };
 
-    try {
-      await channel.invokeMethod<String>('sendMessage', {
-        'message': jsonEncode(ackPacket),
-      });
+    final success = await sendPacketToDevice(
+      senderAddress,
+      jsonEncode(ackPacket),
+    );
 
-      debugPrint('ACK sent for message: $messageId');
-    } catch (e) {
-      debugPrint('ACK send error: $e');
+    if (success) {
+      debugPrint('ACK sent for message: $messageId to $senderAddress');
+    } else {
+      debugPrint('ACK send failed for $messageId');
     }
   }
 
-  Future<void> handleAck(String messageId, String senderDeviceId) async {
-    if (!isConnected || senderDeviceId != peerDeviceId) {
+  Future<void> handleAck(
+    String messageId,
+    String senderDeviceId,
+    String senderAddress,
+  ) async {
+    final expectedDeviceId = peerIdsByAddress[senderAddress];
+
+    if (!connectedAddresses.contains(senderAddress) ||
+        expectedDeviceId == null ||
+        expectedDeviceId != senderDeviceId) {
       debugPrint('ACK rejected: unexpected sender');
       return;
     }
@@ -175,7 +203,10 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> saveReceivedJsonMessage(Message message) async {
+  Future<void> saveReceivedJsonMessage(
+    Message message,
+    String senderAddress,
+  ) async {
     try {
       final savedMessage = message.copyWith(status: 'received');
 
@@ -183,7 +214,7 @@ class _HomeScreenState extends State<HomeScreen> {
         savedMessage,
       );
 
-      await sendAck(message.id);
+      await sendAck(message.id, senderAddress);
 
       if (!inserted) {
         debugPrint('Duplicate message ignored: ${message.id}');
@@ -212,16 +243,20 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> forwardMessagesToPeer() async {
-    if (!isConnected || peerDeviceId.isEmpty) {
+  Future<void> forwardMessagesToPeer(String address) async {
+    final destinationId = peerIdsByAddress[address];
+
+    if (!connectedAddresses.contains(address) ||
+        destinationId == null ||
+        destinationId.isEmpty) {
       return;
     }
 
     final pendingMessages = await DatabaseHelper.instance
-        .getMessagesForReceiver(peerDeviceId);
+        .getMessagesForReceiver(destinationId);
 
     for (final message in pendingMessages) {
-      if (!isConnected) {
+      if (!connectedAddresses.contains(address)) {
         break;
       }
 
@@ -236,20 +271,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
 
-      try {
-        await channel.invokeMethod<String>('sendMessage', {
-          'message': forwardedMessage.toWireJson(),
-        });
+      final success = await sendPacketToDevice(
+        address,
+        forwardedMessage.toWireJson(),
+      );
 
-        debugPrint('Forwarded message ${message.id} to $peerDeviceId');
-      } catch (e) {
-        debugPrint('Forwarding error: $e');
+      if (success) {
+        debugPrint('Forwarded message ${message.id} to $destinationId');
+      } else {
+        debugPrint('Forwarding failed: ${message.id}');
         break;
       }
     }
   }
 
-  void handleIncomingPacket(String raw) {
+  void handleIncomingPacket(String raw, String senderAddress) {
     try {
       final data = jsonDecode(raw);
 
@@ -266,11 +302,11 @@ class _HomeScreenState extends State<HomeScreen> {
             receivedDeviceId.isNotEmpty &&
             receivedDeviceId != localDeviceId) {
           setState(() {
-            peerDeviceId = receivedDeviceId;
-            status = 'Peer UUID received!';
+            peerIdsByAddress[senderAddress] = receivedDeviceId;
+            status = 'Peer UUID received from $senderAddress';
           });
 
-          forwardMessagesToPeer();
+          forwardMessagesToPeer(senderAddress);
         }
 
         return;
@@ -281,7 +317,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final senderDeviceId = data['deviceId'];
 
         if (messageId is String && senderDeviceId is String) {
-          handleAck(messageId, senderDeviceId);
+          handleAck(messageId, senderDeviceId, senderAddress);
         }
 
         return;
@@ -291,9 +327,9 @@ class _HomeScreenState extends State<HomeScreen> {
         final message = Message.fromWireJson(raw);
 
         if (message.receiverId == localDeviceId) {
-          saveReceivedJsonMessage(message);
+          saveReceivedJsonMessage(message, senderAddress);
         } else {
-          saveRelayMessage(message);
+          saveRelayMessage(message, senderAddress);
         }
 
         return;
@@ -311,22 +347,77 @@ class _HomeScreenState extends State<HomeScreen> {
     final type = event['type']?.toString();
     final value = event['value']?.toString() ?? '';
 
-    if (type == 'status') {
-      final wasConnected = isConnected;
+    if (type == 'deviceFound') {
+      final rawDevice = event['value'];
 
-      setState(() {
-        connectionStatus = value;
+      if (rawDevice is Map) {
+        final device = BluetoothDeviceInfo.fromMap(rawDevice);
 
-        if (!value.startsWith('Connected:')) {
-          peerDeviceId = '';
+        if (device.address.isNotEmpty) {
+          setState(() {
+            discoveredDevices.removeWhere(
+              (existing) => existing.address == device.address,
+            );
+
+            discoveredDevices.add(device);
+          });
         }
+      }
+
+      return;
+    }
+
+    if (type == 'discoveryFinished') {
+      setState(() {
+        isScanning = false;
+        status = 'Discovery finished';
       });
 
-      if (isConnected && !wasConnected) {
-        sendHello();
+      return;
+    }
+
+    if (type == 'peerConnected') {
+      final address = event['address']?.toString() ?? '';
+
+      if (address.isNotEmpty) {
+        loadConnectedDevices().then((_) {
+          if (mounted && connectedAddresses.contains(address)) {
+            sendHello(address);
+          }
+        });
       }
+
+      return;
+    }
+
+    if (type == 'peerDisconnected') {
+      final address = event['address']?.toString() ?? '';
+
+      if (address.isNotEmpty) {
+        setState(() {
+          peerIdsByAddress.remove(address);
+        });
+      }
+
+      loadConnectedDevices();
+      return;
+    }
+
+    if (type == 'peersChanged') {
+      loadConnectedDevices();
+      return;
+    }
+
+    if (type == 'status') {
+      setState(() {
+        connectionStatus = value;
+      });
     } else if (type == 'message') {
-      handleIncomingPacket(value);
+      final senderAddress = event['address']?.toString() ?? '';
+
+      if (senderAddress.isNotEmpty) {
+        handleIncomingPacket(value, senderAddress);
+      }
     }
   }
 
@@ -360,6 +451,37 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> scanNearbyDevices() async {
+    if (isScanning) return;
+
+    setState(() {
+      discoveredDevices.clear();
+      isScanning = true;
+      status = 'Scanning nearby devices...';
+    });
+
+    try {
+      final result = await channel.invokeMethod<String>('startDiscovery');
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'Unknown discovery status';
+
+        if (result != 'Discovery started') {
+          isScanning = false;
+        }
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        isScanning = false;
+        status = 'Discovery error: ${e.message}';
+      });
+    }
+  }
+
   Future<void> loadPairedDevices() async {
     try {
       final result = await channel.invokeMethod<List<dynamic>>(
@@ -388,6 +510,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> loadConnectedDevices() async {
+    try {
+      final result = await channel.invokeMethod<List<dynamic>>(
+        'getConnectedDevices',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        connectedAddresses = (result ?? [])
+            .map((item) => Map<dynamic, dynamic>.from(item as Map))
+            .map((item) => item['address']?.toString() ?? '')
+            .where((address) => address.isNotEmpty)
+            .toList();
+
+        connectionStatus = connectedAddresses.isEmpty
+            ? 'Disconnected'
+            : 'Connected (${connectedAddresses.length})';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Connection list error: ${e.message}';
+      });
+    }
+  }
+
   Future<void> connectToDevice(String address) async {
     try {
       final result = await channel.invokeMethod<String>('connectToDevice', {
@@ -404,6 +554,28 @@ class _HomeScreenState extends State<HomeScreen> {
 
       setState(() {
         status = 'Error: ${e.message}';
+      });
+    }
+  }
+
+  Future<void> disconnectFromDevice(String address) async {
+    try {
+      final result = await channel.invokeMethod<String>('disconnectDevice', {
+        'address': address,
+      });
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'Device disconnected';
+      });
+
+      await loadConnectedDevices();
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Disconnect error: ${e.message}';
       });
     }
   }
@@ -426,18 +598,41 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  String? findAddressByDeviceId(String deviceId) {
+    for (final entry in peerIdsByAddress.entries) {
+      if (entry.value == deviceId && connectedAddresses.contains(entry.key)) {
+        return entry.key;
+      }
+    }
+
+    return null;
+  }
+
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
 
-    final destinationId = receiverController.text.trim().isEmpty
-        ? peerDeviceId
-        : receiverController.text.trim();
+    final enteredReceiverId = receiverController.text.trim();
+
+    final destinationId = enteredReceiverId.isNotEmpty
+        ? enteredReceiverId
+        : connectedAddresses.length == 1
+        ? (peerIdsByAddress[connectedAddresses.first] ?? '')
+        : '';
+
+    final destinationAddress = findAddressByDeviceId(destinationId);
 
     if (text.isEmpty ||
         !isConnected ||
         sending ||
         localDeviceId.isEmpty ||
-        peerDeviceId.isEmpty) {
+        destinationId.isEmpty) {
+      return;
+    }
+
+    if (destinationAddress == null) {
+      setState(() {
+        status = 'Destination device is not directly connected';
+      });
       return;
     }
     setState(() {
@@ -451,7 +646,8 @@ class _HomeScreenState extends State<HomeScreen> {
         text: text,
       );
 
-      final result = await channel.invokeMethod<String>('sendMessage', {
+      final result = await channel.invokeMethod<String>('sendMessageToDevice', {
+        'address': destinationAddress,
         'message': message.toWireJson(),
       });
 
@@ -581,7 +777,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> saveRelayMessage(Message message) async {
+  Future<void> saveRelayMessage(Message message, String senderAddress) async {
     try {
       final relayMessage = message.copyWith(status: 'pending');
 
@@ -589,7 +785,7 @@ class _HomeScreenState extends State<HomeScreen> {
         relayMessage,
       );
 
-      await sendAck(message.id);
+      await sendAck(message.id, senderAddress);
 
       if (inserted) {
         debugPrint('Relay message saved: ${message.id}');
@@ -618,7 +814,9 @@ class _HomeScreenState extends State<HomeScreen> {
       await loadMessagesFromDatabase();
 
       if (isConnected) {
-        await sendHello();
+        for (final address in connectedAddresses) {
+          await sendHello(address);
+        }
       }
     } catch (e) {
       if (!mounted) return;
@@ -669,9 +867,16 @@ class _HomeScreenState extends State<HomeScreen> {
             style: TextStyle(fontWeight: FontWeight.bold),
           ),
 
-          SelectableText(
-            peerDeviceId.isEmpty ? 'Not received yet' : peerDeviceId,
-          ),
+          if (peerIdsByAddress.isEmpty)
+            const Text('No peer UUIDs received yet'),
+
+          for (final entry in peerIdsByAddress.entries)
+            ListTile(
+              dense: true,
+              title: SelectableText(entry.value),
+              subtitle: Text('Bluetooth: ${entry.key}'),
+            ),
+
           const Divider(height: 30),
           const Icon(Icons.bluetooth, size: 55, color: Colors.blue),
 
@@ -711,6 +916,42 @@ class _HomeScreenState extends State<HomeScreen> {
           const Divider(height: 30),
 
           const Text(
+            'Nearby Bluetooth Devices',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+
+          const SizedBox(height: 12),
+
+          ElevatedButton.icon(
+            onPressed: isScanning ? null : scanNearbyDevices,
+            icon: const Icon(Icons.bluetooth_searching),
+            label: Text(isScanning ? 'Scanning...' : 'Scan Nearby'),
+          ),
+
+          ElevatedButton.icon(
+            onPressed: () => callKotlin('requestDiscoverable'),
+            icon: const Icon(Icons.visibility),
+            label: const Text('Make My Device Visible'),
+          ),
+
+          const SizedBox(height: 12),
+
+          for (final device in discoveredDevices)
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.smartphone),
+                title: Text(device.name),
+                subtitle: Text(device.address),
+                trailing: IconButton(
+                  icon: const Icon(Icons.link),
+                  onPressed: () => connectToDevice(device.address),
+                ),
+              ),
+            ),
+
+          const Divider(height: 30),
+
+          const Text(
             'Bluetooth Client',
             style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
@@ -736,6 +977,34 @@ class _HomeScreenState extends State<HomeScreen> {
           const Divider(height: 30),
 
           const Text(
+            'Connected Devices',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+
+          const SizedBox(height: 12),
+
+          if (connectedAddresses.isEmpty) const Text('No connected devices'),
+
+          for (final address in connectedAddresses)
+            Card(
+              child: ListTile(
+                leading: const Icon(
+                  Icons.bluetooth_connected,
+                  color: Colors.green,
+                ),
+                title: Text(address, style: const TextStyle(fontSize: 14)),
+                subtitle: const Text('Connected'),
+                trailing: IconButton(
+                  icon: const Icon(Icons.link_off),
+                  tooltip: 'Disconnect',
+                  onPressed: () => disconnectFromDevice(address),
+                ),
+              ),
+            ),
+
+          const SizedBox(height: 12),
+
+          const Text(
             'Connection Status',
             style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
           ),
@@ -752,7 +1021,13 @@ class _HomeScreenState extends State<HomeScreen> {
           ElevatedButton(
             onPressed: () async {
               await callKotlin('disconnect');
-              await refreshConnectionStatus();
+              await loadConnectedDevices();
+
+              if (!mounted) return;
+
+              setState(() {
+                peerIdsByAddress.clear();
+              });
             },
             child: const Text('Disconnect'),
           ),
