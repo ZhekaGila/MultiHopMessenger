@@ -1,4 +1,3 @@
-
 package com.example.multihop_messenger
 
 import android.Manifest
@@ -14,486 +13,478 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.BufferedReader
+import java.io.BufferedWriter
 import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.io.BufferedWriter
 import java.util.UUID
 
-class MainActivity : FlutterActivity() {
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.app.Activity
 
+class MainActivity : FlutterActivity() {
     private val methodChannelName = "multihop/bluetooth"
     private val eventChannelName = "multihop/bluetooth_events"
     private val permissionRequestCode = 1001
-
     private val serviceName = "MultiHopMessenger"
-    private val serviceUUID = UUID.fromString(
-        "8b32a43c-7a5f-4a52-9a5e-6b80cde41f21"
+    private val serviceUUID = UUID.fromString("8b32a43c-7a5f-4a52-9a5e-6b80cde41f21")
+
+    private val discoveredDevices = mutableMapOf<String, Map<String, String>>()
+    private var discoveryReceiverRegistered = false
+
+    private data class PeerConnection(
+        val socket: BluetoothSocket,
+        val writer: BufferedWriter
     )
 
     private val lock = Any()
-
+    private val peers = mutableMapOf<String, PeerConnection>()
+    private val connectingAddresses = mutableSetOf<String>()
     private var serverSocket: BluetoothServerSocket? = null
-    private var connectionSocket: BluetoothSocket? = null
-    private var serverThread: Thread? = null
-    private var connectThread: Thread? = null
-    private var readerThread: Thread? = null
+    @Volatile private var serverRunning = false
+    @Volatile private var eventSink: EventChannel.EventSink? = null
+    @Volatile private var connectionStatus = "Disconnected"
 
-    private var writer: BufferedWriter? = null
-    private var eventSink: EventChannel.EventSink? = null
 
-    @Volatile
-    private var serverRunning = false
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    if (!hasConnectPermission()) return
 
-    @Volatile
-    private var connecting = false
+                    val device = if (Build.VERSION.SDK_INT >= 33) {
+                        intent.getParcelableExtra(
+                            BluetoothDevice.EXTRA_DEVICE,
+                            BluetoothDevice::class.java
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra<BluetoothDevice>(
+                            BluetoothDevice.EXTRA_DEVICE
+                        )
+                    } ?: return
 
-    @Volatile
-    private var connectionStatus = "Disconnected"
+                    val address = device.address
+                    val name = device.name ?: "Unknown device"
 
-    private val bluetoothAdapter: BluetoothAdapter?
-        get() {
-            val manager = getSystemService(
-                Context.BLUETOOTH_SERVICE
-            ) as BluetoothManager
-            return manager.adapter
+                    val info = mapOf(
+                        "name" to name,
+                        "address" to address
+                    )
+
+                    discoveredDevices[address] = info
+
+                    runOnUiThread {
+                        eventSink?.success(
+                            mapOf(
+                                "type" to "deviceFound",
+                                "value" to info
+                            )
+                        )
+                    }
+                }
+
+                BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                    sendEvent("discoveryFinished", "Discovery finished")
+                }
+            }
+        }
+    }
+
+    private fun startDiscovery(): String {
+        if (!hasScanPermission() || !hasConnectPermission()) {
+            return "Bluetooth permissions required"
         }
 
-    private fun hasConnectPermission(): Boolean {
-        return Build.VERSION.SDK_INT < 31 ||
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
+        val adapter = bluetoothAdapter
+            ?: return "Bluetooth not supported"
+
+        if (!adapter.isEnabled) {
+            return "Bluetooth is OFF"
+        }
+
+        if (!discoveryReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(
+                    discoveryReceiver,
+                    filter,
+                    Context.RECEIVER_EXPORTED
+                )
+            } else {
+                registerReceiver(discoveryReceiver, filter)
+            }
+
+            discoveryReceiverRegistered = true
+        }
+
+        discoveredDevices.clear()
+
+        if (adapter.isDiscovering) {
+            adapter.cancelDiscovery()
+        }
+
+        return if (adapter.startDiscovery()) {
+            "Discovery started"
+        } else {
+            "Failed to start discovery"
+        }
     }
 
-    private fun hasScanPermission(): Boolean {
-        return Build.VERSION.SDK_INT < 31 ||
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
+    private fun requestDiscoverable(): String {
+        if (!hasConnectPermission()) {
+            return "Bluetooth connect permission required"
+        }
+
+        val adapter = bluetoothAdapter
+            ?: return "Bluetooth not supported"
+
+        if (!adapter.isEnabled) {
+            return "Bluetooth is OFF"
+        }
+
+        val intent = Intent(
+            BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE
+        ).apply {
+            putExtra(
+                BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION,
+                300
+            )
+        }
+
+        return try {
+            startActivity(intent)
+            "Discoverability request started"
+        } catch (e: Exception) {
+            "Discoverability request failed: ${e.message}"
+        }
     }
+        
+
+
+    private fun stopDiscovery(): String {
+        if (!hasScanPermission()) {
+            return "Bluetooth scan permission required"
+        }
+
+        val adapter = bluetoothAdapter
+            ?: return "Bluetooth not supported"
+
+        if (adapter.isDiscovering) {
+            adapter.cancelDiscovery()
+        }
+
+        return "Discovery stopped"
+    }
+
+    private val bluetoothAdapter: BluetoothAdapter?
+        get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+
+    private fun hasConnectPermission() = Build.VERSION.SDK_INT < 31 ||
+        checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasScanPermission() = Build.VERSION.SDK_INT < 31 ||
+        checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
 
     private fun requestBluetoothPermission() {
         if (Build.VERSION.SDK_INT >= 31) {
             requestPermissions(
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.BLUETOOTH_SCAN
-                ),
+                arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_ADVERTISE),
                 permissionRequestCode
             )
         }
     }
 
-    private fun sendEvent(
-        type: String,
-        value: String
-    ) {
+    private fun sendEvent(type: String, value: String, address: String? = null) {
         runOnUiThread {
-            eventSink?.success(
-                mapOf(
-                    "type" to type,
-                    "value" to value
-                )
-            )
+            val event = mutableMapOf<String, String>("type" to type, "value" to value)
+            if (address != null) event["address"] = address
+            eventSink?.success(event)
         }
     }
 
-    private fun updateStatus(value: String) {
-        connectionStatus = value
-        sendEvent("status", value)
+    private fun refreshStatus() {
+        val count = synchronized(lock) { peers.size }
+        connectionStatus = if (count > 0) "Connected ($count)" else if (serverRunning) "Waiting for connection..." else "Disconnected"
+        sendEvent("status", connectionStatus)
+        sendEvent("peersChanged", count.toString())
     }
 
     private fun closeServerSocket() {
         serverRunning = false
-
-        try {
-            serverSocket?.close()
-        } catch (_: IOException) {
+        val socket = synchronized(lock) {
+            val old = serverSocket
+            serverSocket = null
+            old
         }
-
-        serverSocket = null
+        try { socket?.close() } catch (_: IOException) { }
     }
 
-    private fun closeConnection(
-        expectedSocket: BluetoothSocket? = null
-    ) {
-        synchronized(lock) {
-            if (
-                expectedSocket != null &&
-                connectionSocket !== expectedSocket
-            ) {
-                return
-            }
+    private fun closePeer(address: String, expected: BluetoothSocket? = null) {
+        val peer = synchronized(lock) {
+            val current = peers[address]
+            if (current == null || (expected != null && current.socket !== expected)) null
+            else peers.remove(address)
+        } ?: return
+        try { peer.socket.close() } catch (_: IOException) { }
+        sendEvent("peerDisconnected", address, address)
+        refreshStatus()
+    }
 
-            val socket = connectionSocket
-            connectionSocket = null
-            writer = null
-
-            try {
-                socket?.close()
-            } catch (_: IOException) {
+    private fun registerPeer(socket: BluetoothSocket) {
+        if (!hasConnectPermission()) {
+            try { socket.close() } catch (_: IOException) { }
+            return
+        }
+        val address = socket.remoteDevice.address
+        val writer = try {
+            BufferedWriter(OutputStreamWriter(socket.outputStream, Charsets.UTF_8))
+        } catch (_: IOException) {
+            try { socket.close() } catch (_: IOException) { }
+            return
+        }
+        val inserted = synchronized(lock) {
+            if (peers.containsKey(address)) false
+            else {
+                peers[address] = PeerConnection(socket, writer)
+                true
             }
         }
+        if (!inserted) {
+            try { socket.close() } catch (_: IOException) { }
+            return
+        }
+        sendEvent("peerConnected", address, address)
+        refreshStatus()
+        Thread {
+            try {
+                val reader = BufferedReader(InputStreamReader(socket.inputStream, Charsets.UTF_8))
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    sendEvent("message", line, address)
+                }
+            } catch (_: IOException) {
+                // Remote device disconnected.
+            } finally {
+                closePeer(address, socket)
+            }
+        }.start()
     }
 
     private fun startBluetoothServer(): String {
-        if (!hasConnectPermission()) {
-            return "Bluetooth permission required"
-        }
-
-        val adapter = bluetoothAdapter
-            ?: return "Bluetooth not supported"
-
-        if (!adapter.isEnabled) {
-            return "Bluetooth is OFF"
-        }
-
-        if (serverRunning) {
-            return "Server is already running"
-        }
-
-        if (connectionSocket != null || connecting) {
-            return "Connection already active"
-        }
-
+        if (!hasConnectPermission()) return "Bluetooth permission required"
+        val adapter = bluetoothAdapter ?: return "Bluetooth not supported"
+        if (!adapter.isEnabled) return "Bluetooth is OFF"
+        if (serverRunning) return "Server is already running"
         return try {
-            val socket = adapter.listenUsingRfcommWithServiceRecord(
-                serviceName,
-                serviceUUID
-            )
-
-            serverSocket = socket
+            val listener = adapter.listenUsingRfcommWithServiceRecord(serviceName, serviceUUID)
+            synchronized(lock) { serverSocket = listener }
             serverRunning = true
-            updateStatus("Waiting for connection...")
-
-            serverThread = Thread {
+            refreshStatus()
+            Thread {
                 try {
-                    val acceptedSocket = socket.accept()
-
-                    if (serverRunning) {
-                        serverRunning = false
-                        startMessageReader(acceptedSocket)
-                    } else {
-                        acceptedSocket.close()
+                    while (serverRunning) {
+                        val incoming = listener.accept()
+                        if (serverRunning) registerPeer(incoming)
+                        else try { incoming.close() } catch (_: IOException) { }
                     }
-
                 } catch (e: IOException) {
-                    if (serverRunning) {
-                        updateStatus("Server error: ${e.message}")
-                    }
-
+                    if (serverRunning) sendEvent("error", "Server error: ${e.message}")
                 } finally {
-                    closeServerSocket()
+                    // Do not close a newer listener from an older server thread.
+                    synchronized(lock) {
+                        if (serverSocket === listener) {
+                            serverSocket = null
+                            serverRunning = false
+                        }
+                    }
+                    try { listener.close() } catch (_: IOException) { }
+                    refreshStatus()
                 }
-            }
-
-            serverThread?.start()
+            }.start()
             "Waiting for connection..."
-
         } catch (e: Exception) {
-            serverRunning = false
-            updateStatus("Server error: ${e.message}")
-            connectionStatus
+            sendEvent("error", "Server error: ${e.message}")
+            "Server error: ${e.message}"
         }
     }
 
     private fun getPairedDevices(): List<Map<String, String>> {
-        if (!hasConnectPermission()) {
-            throw SecurityException("Bluetooth permission required")
-        }
-
-        val adapter = bluetoothAdapter
-            ?: throw IllegalStateException("Bluetooth not supported")
-
-        if (!adapter.isEnabled) {
-            throw IllegalStateException("Bluetooth is OFF")
-        }
-
+        if (!hasConnectPermission()) throw SecurityException("Bluetooth permission required")
+        val adapter = bluetoothAdapter ?: throw IllegalStateException("Bluetooth not supported")
+        if (!adapter.isEnabled) throw IllegalStateException("Bluetooth is OFF")
         return adapter.bondedDevices.map { device ->
-            mapOf(
-                "name" to (device.name ?: "Unknown device"),
-                "address" to device.address
-            )
+            mapOf("name" to (device.name ?: "Unknown device"), "address" to device.address)
         }.sortedBy { it["name"] }
     }
 
     private fun connectToDevice(address: String): String {
-        if (!hasConnectPermission()) {
-            return "Bluetooth permission required"
+        if (!hasConnectPermission()) return "Bluetooth permission required"
+        val adapter = bluetoothAdapter ?: return "Bluetooth not supported"
+        if (!adapter.isEnabled) return "Bluetooth is OFF"
+        if (!BluetoothAdapter.checkBluetoothAddress(address)) return "Invalid Bluetooth address"
+        synchronized(lock) {
+            if (peers.containsKey(address)) return "Already connected"
+            if (!connectingAddresses.add(address)) return "Already connecting"
         }
-
-        val adapter = bluetoothAdapter
-            ?: return "Bluetooth not supported"
-
-        if (!adapter.isEnabled) {
-            return "Bluetooth is OFF"
-        }
-
-        if (!BluetoothAdapter.checkBluetoothAddress(address)) {
-            return "Invalid Bluetooth address"
-        }
-
-        if (connectionSocket != null || connecting) {
-            return "Connection already active"
-        }
-
-        if (serverRunning) {
-            return "Stop server before connecting"
-        }
-
-        connecting = true
-        updateStatus("Connecting...")
-
-        connectThread = Thread {
+        Thread {
             var socket: BluetoothSocket? = null
-
             try {
                 val device = adapter.getRemoteDevice(address)
-
-                socket = device.createRfcommSocketToServiceRecord(
-                    serviceUUID
-                )
-
-                if (hasScanPermission()) {
-                    adapter.cancelDiscovery()
-                }
-
+                socket = device.createRfcommSocketToServiceRecord(serviceUUID)
+                if (hasScanPermission()) adapter.cancelDiscovery()
                 socket.connect()
-
-                if (connecting) {
-                    startMessageReader(socket)
-                } else {
-                    socket.close()
-                }
-
+                registerPeer(socket)
+                socket = null // Ownership transferred to registerPeer.
             } catch (e: Exception) {
-                try {
-                    socket?.close()
-                } catch (_: IOException) {
-                }
-
-                if (connecting) {
-                    updateStatus("Connection failed: ${e.message}")
-                }
-
+                sendEvent("error", "Connection failed ($address): ${e.message}", address)
             } finally {
-                connecting = false
+                try { socket?.close() } catch (_: IOException) { }
+                synchronized(lock) { connectingAddresses.remove(address) }
             }
-        }
-
-        connectThread?.start()
+        }.start()
         return "Connecting..."
     }
 
-    private fun startMessageReader(socket: BluetoothSocket) {
-        synchronized(lock) {
-            connectionSocket = socket
-            writer = BufferedWriter(
-                OutputStreamWriter(
-                    socket.outputStream,
-                    Charsets.UTF_8
-                )
-            )
-        }
-
-        updateStatus("Connected: ${socket.remoteDevice.address}")
-
-        readerThread = Thread {
-            try {
-                val reader = BufferedReader(
-                    InputStreamReader(
-                        socket.inputStream,
-                        Charsets.UTF_8
-                    )
-                )
-
-                while (true) {
-                    val message = reader.readLine() ?: break
-                    sendEvent("message", message)
-                }
-
-            } catch (_: IOException) {
-                // The connection was closed or interrupted.
-
-            } finally {
-                val wasCurrent = synchronized(lock) {
-                    connectionSocket === socket
-                }
-
-                closeConnection(socket)
-
-                if (wasCurrent) {
-                    updateStatus("Disconnected")
-                }
-            }
-        }
-
-        readerThread?.start()
-    }
-
-    private fun sendMessage(message: String): String {
-        if (message.isBlank()) {
-            return "Message is empty"
-        }
-
-        if (message.contains('\n') || message.contains('\r')) {
-            return "Multiline messages are not supported yet"
-        }
-
-        val socket = synchronized(lock) {
-            connectionSocket
-        } ?: return "Not connected"
-
-        val currentWriter = synchronized(lock) {
-            writer
-        } ?: return "Not connected"
-
+    private fun sendMessageToDevice(address: String, message: String): String {
+        if (message.isBlank()) return "Message is empty"
+        if (message.contains('\n') || message.contains('\r')) return "Multiline messages are not supported yet"
+        val peer = synchronized(lock) { peers[address] } ?: return "Not connected: $address"
         return try {
-            synchronized(currentWriter) {
-                currentWriter.write(message)
-                currentWriter.newLine()
-                currentWriter.flush()
+            synchronized(peer.writer) {
+                peer.writer.write(message)
+                peer.writer.newLine()
+                peer.writer.flush()
             }
-
             "Message sent"
-
         } catch (e: IOException) {
-            closeConnection(socket)
-            updateStatus("Disconnected: ${e.message}")
+            closePeer(address, peer.socket)
             "Send failed: ${e.message}"
         }
     }
 
+    private fun sendMessage(message: String): String {
+        val addresses = synchronized(lock) { peers.keys.toList() }
+        return when (addresses.size) {
+            0 -> "Not connected"
+            1 -> sendMessageToDevice(addresses.first(), message)
+            else -> "Multiple devices connected; use sendMessageToDevice"
+        }
+    }
+
+    private fun getConnectedDevices(): List<Map<String, String>> = synchronized(lock) {
+        peers.keys.map { address -> mapOf("address" to address) }
+    }
+
     private fun disconnect(): String {
-        connecting = false
         closeServerSocket()
-        closeConnection()
-        updateStatus("Disconnected")
+        val addresses = synchronized(lock) { peers.keys.toList() }
+        addresses.forEach { closePeer(it) }
+        refreshStatus()
         return "Disconnected"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-
-        EventChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            eventChannelName
-        ).setStreamHandler(
-            object : EventChannel.StreamHandler {
-                override fun onListen(
-                    arguments: Any?,
-                    events: EventChannel.EventSink?
-                ) {
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, eventChannelName)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     eventSink = events
-                    sendEvent("status", connectionStatus)
+                    refreshStatus()
                 }
+                override fun onCancel(arguments: Any?) { eventSink = null }
+            })
 
-                override fun onCancel(arguments: Any?) {
-                    eventSink = null
-                }
-            }
-        )
-
-        MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            methodChannelName
-        ).setMethodCallHandler { call, result ->
-
-            when (call.method) {
-
-                "checkBluetooth" -> {
-                    val adapter = bluetoothAdapter
-
-                    result.success(
-                        when {
-                            adapter == null ->
-                                "Bluetooth not supported"
-
-                            !hasConnectPermission() ->
-                                "Bluetooth permission required"
-
-                            adapter.isEnabled ->
-                                "Bluetooth is ON"
-
-                            else ->
-                                "Bluetooth is OFF"
-                        }
-                    )
-                }
-
-                "requestBluetoothPermission" -> {
-                    requestBluetoothPermission()
-                    result.success("Permission request started")
-                }
-
-                "startServer" -> {
-                    result.success(startBluetoothServer())
-                }
-
-                "stopServer" -> {
-                    closeServerSocket()
-
-                    if (connectionSocket == null) {
-                        updateStatus("Server stopped")
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, methodChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "startDiscovery" -> {
+                        result.success(startDiscovery())
                     }
-
-                    result.success("Server stopped")
-                }
-
-                "getPairedDevices" -> {
-                    try {
+                    "requestDiscoverable" -> {
+                        result.success(requestDiscoverable())
+                    }
+                    "stopDiscovery" -> {
+                        result.success(stopDiscovery())
+                    }
+                    "getDiscoveredDevices" -> {
+                        result.success(discoveredDevices.values.toList())
+                    }
+                    "checkBluetooth" -> {
+                        val adapter = bluetoothAdapter
+                        result.success(when {
+                            adapter == null -> "Bluetooth not supported"
+                            !hasConnectPermission() -> "Bluetooth permission required"
+                            adapter.isEnabled -> "Bluetooth is ON"
+                            else -> "Bluetooth is OFF"
+                        })
+                    }
+                    "requestBluetoothPermission" -> {
+                        requestBluetoothPermission()
+                        result.success("Permission request started")
+                    }
+                    "startServer" -> result.success(startBluetoothServer())
+                    "stopServer" -> {
+                        closeServerSocket()
+                        refreshStatus()
+                        result.success("Server stopped")
+                    }
+                    "getPairedDevices" -> try {
                         result.success(getPairedDevices())
                     } catch (e: Exception) {
-                        result.error(
-                            "BLUETOOTH_ERROR",
-                            e.message,
-                            null
-                        )
+                        result.error("BLUETOOTH_ERROR", e.message, null)
                     }
-                }
-
-                "connectToDevice" -> {
-                    val address = call.argument<String>("address")
-
-                    if (address.isNullOrBlank()) {
-                        result.error(
-                            "INVALID_ADDRESS",
-                            "Device address is missing",
-                            null
-                        )
-                    } else {
-                        result.success(connectToDevice(address))
+                    "connectToDevice" -> {
+                        val address = call.argument<String>("address")
+                        if (address.isNullOrBlank()) result.error("INVALID_ADDRESS", "Device address is missing", null)
+                        else result.success(connectToDevice(address))
                     }
-                }
-
-                "getConnectionStatus" -> {
-                    result.success(connectionStatus)
-                }
-
-                "sendMessage" -> {
-                    val message = call.argument<String>("message") ?: ""
-
-                    Thread {
-                        val response = sendMessage(message)
-                        runOnUiThread {
-                            result.success(response)
+                    "getConnectionStatus" -> result.success(connectionStatus)
+                    "getConnectedDevices" -> result.success(getConnectedDevices())
+                    "sendMessage" -> {
+                        val message = call.argument<String>("message") ?: ""
+                        Thread {
+                            val response = sendMessage(message)
+                            runOnUiThread { result.success(response) }
+                        }.start()
+                    }
+                    "sendMessageToDevice" -> {
+                        val address = call.argument<String>("address")
+                        val message = call.argument<String>("message") ?: ""
+                        if (address.isNullOrBlank()) result.error("INVALID_ADDRESS", "Device address is missing", null)
+                        else Thread {
+                            val response = sendMessageToDevice(address, message)
+                            runOnUiThread { result.success(response) }
+                        }.start()
+                    }
+                    "disconnectDevice" -> {
+                        val address = call.argument<String>("address")
+                        if (address.isNullOrBlank()) result.error("INVALID_ADDRESS", "Device address is missing", null)
+                        else {
+                            closePeer(address)
+                            result.success("Disconnected: $address")
                         }
-                    }.start()
+                    }
+                    "disconnect" -> result.success(disconnect())
+                    else -> result.notImplemented()
                 }
-
-                "disconnect" -> {
-                    result.success(disconnect())
-                }
-
-                else -> result.notImplemented()
             }
-        }
     }
 
     override fun onDestroy() {
         disconnect()
         eventSink = null
+        if (discoveryReceiverRegistered) {
+            unregisterReceiver(discoveryReceiver)
+            discoveryReceiverRegistered = false
+        }
         super.onDestroy()
     }
 }

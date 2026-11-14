@@ -74,23 +74,45 @@ class _HomeScreenState extends State<HomeScreen> {
   String connectionStatus = 'Disconnected';
 
   List<BluetoothDeviceInfo> pairedDevices = [];
+  List<BluetoothDeviceInfo> discoveredDevices = [];
+
+  List<String> connectedAddresses = [];
+
+  bool isScanning = false;
+
   List<ChatMessage> messages = [];
 
   bool sending = false;
 
+  int selectedTab = 0;
+
+  List<String> conversationPeerIds = [];
+
+  String? selectedPeerId;
+
+  List<Message> conversationMessages = [];
+
+  bool loadingMessages = false;
+
+  bool loadingConversations = false;
+
   String localDeviceId = '';
 
-  String peerDeviceId = '';
+  final Map<String, String> peerIdsByAddress = {};
+
+  final Map<String, String> reachablePeers = {};
 
   static const int maxHopCount = 5;
 
-  bool get isConnected => connectionStatus.startsWith('Connected:');
+  bool get isConnected => connectedAddresses.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
 
     initializeDeviceIdentity();
+
+    loadConnectedDevices();
 
     eventSubscription = eventChannel.receiveBroadcastStream().listen(
       handleBluetoothEvent,
@@ -103,30 +125,67 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> sendHello() async {
-    if (!isConnected || localDeviceId.isEmpty) {
+  Future<bool> sendPacketToDevice(String address, String packet) async {
+    if (!connectedAddresses.contains(address)) {
+      debugPrint('Device not connected: $address');
+      return false;
+    }
+
+    try {
+      final result = await channel.invokeMethod<String>('sendMessageToDevice', {
+        'address': address,
+        'message': packet,
+      });
+
+      return result == 'Message sent';
+    } on PlatformException catch (e) {
+      debugPrint('Bluetooth send error: ${e.message}');
+      return false;
+    }
+  }
+
+  Future<void> sendPeers(String address) async {
+    if (!connectedAddresses.contains(address) || localDeviceId.isEmpty) {
+      return;
+    }
+
+    final peers = peerIdsByAddress.entries
+        .where(
+          (entry) =>
+              connectedAddresses.contains(entry.key) &&
+              entry.key != address &&
+              entry.value.isNotEmpty,
+        )
+        .map((entry) => entry.value)
+        .toList();
+
+    final packet = {'type': 'peers', 'deviceId': localDeviceId, 'peers': peers};
+
+    final success = await sendPacketToDevice(address, jsonEncode(packet));
+
+    if (success) {
+      debugPrint('PEERS sent to $address: $peers');
+    } else {
+      debugPrint('PEERS failed for $address');
+    }
+  }
+
+  Future<void> sendHello(String address) async {
+    if (!connectedAddresses.contains(address) || localDeviceId.isEmpty) {
       return;
     }
 
     final helloPacket = {'type': 'hello', 'deviceId': localDeviceId};
 
-    final jsonString = jsonEncode(helloPacket);
+    final success = await sendPacketToDevice(address, jsonEncode(helloPacket));
 
-    try {
-      await channel.invokeMethod<String>('sendMessage', {
-        'message': jsonString,
-      });
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        status = 'Hello error: $e';
-      });
+    if (!success) {
+      debugPrint('HELLO failed for $address');
     }
   }
 
-  Future<void> sendAck(String messageId) async {
-    if (!isConnected || peerDeviceId.isEmpty) {
+  Future<void> sendAck(String messageId, String senderAddress) async {
+    if (!connectedAddresses.contains(senderAddress) || localDeviceId.isEmpty) {
       return;
     }
 
@@ -136,18 +195,58 @@ class _HomeScreenState extends State<HomeScreen> {
       'deviceId': localDeviceId,
     };
 
-    try {
-      await channel.invokeMethod<String>('sendMessage', {
-        'message': jsonEncode(ackPacket),
-      });
+    final success = await sendPacketToDevice(
+      senderAddress,
+      jsonEncode(ackPacket),
+    );
 
-      debugPrint('ACK sent for message: $messageId');
-    } catch (e) {
-      debugPrint('ACK send error: $e');
+    if (success) {
+      debugPrint('ACK sent for message: $messageId to $senderAddress');
+    } else {
+      debugPrint('ACK send failed for $messageId');
     }
   }
 
-  Future<void> saveReceivedJsonMessage(Message message) async {
+  Future<void> handleAck(
+    String messageId,
+    String senderDeviceId,
+    String senderAddress,
+  ) async {
+    final expectedDeviceId = peerIdsByAddress[senderAddress];
+
+    if (!connectedAddresses.contains(senderAddress) ||
+        expectedDeviceId == null ||
+        expectedDeviceId != senderDeviceId) {
+      debugPrint('ACK rejected: unexpected sender');
+      return;
+    }
+
+    final message = await DatabaseHelper.instance.getMessageById(messageId);
+
+    if (message == null) {
+      debugPrint('ACK ignored: unknown message $messageId');
+      return;
+    }
+
+    if (message.status == 'delivered') {
+      return;
+    }
+
+    if (message.receiverId == senderDeviceId) {
+      await DatabaseHelper.instance.updateMessageStatus(messageId, 'delivered');
+
+      debugPrint('Message delivered: $messageId');
+    } else {
+      await DatabaseHelper.instance.updateMessageStatus(messageId, 'forwarded');
+
+      debugPrint('Message forwarded to relay: $messageId');
+    }
+  }
+
+  Future<void> saveReceivedJsonMessage(
+    Message message,
+    String senderAddress,
+  ) async {
     try {
       final savedMessage = message.copyWith(status: 'received');
 
@@ -155,7 +254,7 @@ class _HomeScreenState extends State<HomeScreen> {
         savedMessage,
       );
 
-      await sendAck(message.id);
+      await sendAck(message.id, senderAddress);
 
       if (!inserted) {
         debugPrint('Duplicate message ignored: ${message.id}');
@@ -172,9 +271,15 @@ class _HomeScreenState extends State<HomeScreen> {
             time: savedMessage.createdAt,
           ),
         );
+
+        if (selectedPeerId == savedMessage.senderId) {
+          conversationMessages.add(savedMessage);
+        }
       });
 
       scrollToBottom();
+
+      await loadConversations();
     } catch (e) {
       if (!mounted) return;
 
@@ -184,16 +289,20 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> forwardMessagesToPeer() async {
-    if (!isConnected || peerDeviceId.isEmpty) {
+  Future<void> forwardMessagesToPeer(String address) async {
+    final destinationId = peerIdsByAddress[address];
+
+    if (!connectedAddresses.contains(address) ||
+        destinationId == null ||
+        destinationId.isEmpty) {
       return;
     }
 
     final pendingMessages = await DatabaseHelper.instance
-        .getMessagesForReceiver(peerDeviceId);
+        .getMessagesForReceiver(destinationId);
 
     for (final message in pendingMessages) {
-      if (!isConnected) {
+      if (!connectedAddresses.contains(address)) {
         break;
       }
 
@@ -208,20 +317,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
 
-      try {
-        await channel.invokeMethod<String>('sendMessage', {
-          'message': forwardedMessage.toWireJson(),
-        });
+      final success = await sendPacketToDevice(
+        address,
+        forwardedMessage.toWireJson(),
+      );
 
-        debugPrint('Forwarded message ${message.id} to $peerDeviceId');
-      } catch (e) {
-        debugPrint('Forwarding error: $e');
+      if (success) {
+        debugPrint('Forwarded message ${message.id} to $destinationId');
+      } else {
+        debugPrint('Forwarding failed: ${message.id}');
         break;
       }
     }
   }
 
-  void handleIncomingPacket(String raw) {
+  void handleIncomingPacket(String raw, String senderAddress) {
     try {
       final data = jsonDecode(raw);
 
@@ -231,6 +341,43 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final packetType = data['type'];
 
+      if (packetType == 'peers') {
+        final senderDeviceId = data['deviceId'];
+        final receivedPeers = data['peers'];
+
+        if (!connectedAddresses.contains(senderAddress) ||
+            senderDeviceId is! String ||
+            peerIdsByAddress[senderAddress] != senderDeviceId ||
+            receivedPeers is! List) {
+          debugPrint('Invalid PEERS packet');
+          return;
+        }
+
+        final peerIds = receivedPeers
+            .whereType<String>()
+            .where(
+              (id) =>
+                  id.isNotEmpty && id != localDeviceId && id != senderDeviceId,
+            )
+            .toSet();
+
+        setState(() {
+          reachablePeers.removeWhere(
+            (deviceId, nextHopAddress) => nextHopAddress == senderAddress,
+          );
+
+          for (final peerId in peerIds) {
+            if (findAddressByDeviceId(peerId) == null) {
+              reachablePeers[peerId] = senderAddress;
+            }
+          }
+        });
+
+        debugPrint('Reachable peers via $senderAddress: $peerIds');
+
+        return;
+      }
+
       if (packetType == 'hello') {
         final receivedDeviceId = data['deviceId'];
 
@@ -238,11 +385,19 @@ class _HomeScreenState extends State<HomeScreen> {
             receivedDeviceId.isNotEmpty &&
             receivedDeviceId != localDeviceId) {
           setState(() {
-            peerDeviceId = receivedDeviceId;
-            status = 'Peer UUID received!';
+            peerIdsByAddress[senderAddress] = receivedDeviceId;
+            status = 'Peer UUID received from $senderAddress';
           });
 
-          forwardMessagesToPeer();
+          forwardMessagesToPeer(senderAddress);
+
+          sendPeers(senderAddress);
+
+          for (final address in connectedAddresses) {
+            if (address != senderAddress) {
+              sendPeers(address);
+            }
+          }
         }
 
         return;
@@ -253,7 +408,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final senderDeviceId = data['deviceId'];
 
         if (messageId is String && senderDeviceId is String) {
-          debugPrint('ACK received for $messageId from $senderDeviceId');
+          handleAck(messageId, senderDeviceId, senderAddress);
         }
 
         return;
@@ -263,9 +418,9 @@ class _HomeScreenState extends State<HomeScreen> {
         final message = Message.fromWireJson(raw);
 
         if (message.receiverId == localDeviceId) {
-          saveReceivedJsonMessage(message);
+          saveReceivedJsonMessage(message, senderAddress);
         } else {
-          saveRelayMessage(message);
+          saveRelayMessage(message, senderAddress);
         }
 
         return;
@@ -283,22 +438,81 @@ class _HomeScreenState extends State<HomeScreen> {
     final type = event['type']?.toString();
     final value = event['value']?.toString() ?? '';
 
-    if (type == 'status') {
-      final wasConnected = isConnected;
+    if (type == 'deviceFound') {
+      final rawDevice = event['value'];
 
-      setState(() {
-        connectionStatus = value;
+      if (rawDevice is Map) {
+        final device = BluetoothDeviceInfo.fromMap(rawDevice);
 
-        if (!value.startsWith('Connected:')) {
-          peerDeviceId = '';
+        if (device.address.isNotEmpty) {
+          setState(() {
+            discoveredDevices.removeWhere(
+              (existing) => existing.address == device.address,
+            );
+
+            discoveredDevices.add(device);
+          });
         }
+      }
+
+      return;
+    }
+
+    if (type == 'discoveryFinished') {
+      setState(() {
+        isScanning = false;
+        status = 'Discovery finished';
       });
 
-      if (isConnected && !wasConnected) {
-        sendHello();
+      return;
+    }
+
+    if (type == 'peerConnected') {
+      final address = event['address']?.toString() ?? '';
+
+      if (address.isNotEmpty) {
+        loadConnectedDevices().then((_) {
+          if (mounted && connectedAddresses.contains(address)) {
+            sendHello(address);
+          }
+        });
       }
+
+      return;
+    }
+
+    if (type == 'peerDisconnected') {
+      final address = event['address']?.toString() ?? '';
+
+      if (address.isNotEmpty) {
+        setState(() {
+          peerIdsByAddress.remove(address);
+
+          reachablePeers.removeWhere(
+            (deviceId, nextHopAddress) => nextHopAddress == address,
+          );
+        });
+      }
+
+      loadConnectedDevices();
+      return;
+    }
+
+    if (type == 'peersChanged') {
+      loadConnectedDevices();
+      return;
+    }
+
+    if (type == 'status') {
+      setState(() {
+        connectionStatus = value;
+      });
     } else if (type == 'message') {
-      handleIncomingPacket(value);
+      final senderAddress = event['address']?.toString() ?? '';
+
+      if (senderAddress.isNotEmpty) {
+        handleIncomingPacket(value, senderAddress);
+      }
     }
   }
 
@@ -332,6 +546,37 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> scanNearbyDevices() async {
+    if (isScanning) return;
+
+    setState(() {
+      discoveredDevices.clear();
+      isScanning = true;
+      status = 'Scanning nearby devices...';
+    });
+
+    try {
+      final result = await channel.invokeMethod<String>('startDiscovery');
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'Unknown discovery status';
+
+        if (result != 'Discovery started') {
+          isScanning = false;
+        }
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        isScanning = false;
+        status = 'Discovery error: ${e.message}';
+      });
+    }
+  }
+
   Future<void> loadPairedDevices() async {
     try {
       final result = await channel.invokeMethod<List<dynamic>>(
@@ -360,6 +605,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> loadConnectedDevices() async {
+    try {
+      final result = await channel.invokeMethod<List<dynamic>>(
+        'getConnectedDevices',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        connectedAddresses = (result ?? [])
+            .map((item) => Map<dynamic, dynamic>.from(item as Map))
+            .map((item) => item['address']?.toString() ?? '')
+            .where((address) => address.isNotEmpty)
+            .toList();
+
+        connectionStatus = connectedAddresses.isEmpty
+            ? 'Disconnected'
+            : 'Connected (${connectedAddresses.length})';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Connection list error: ${e.message}';
+      });
+    }
+  }
+
   Future<void> connectToDevice(String address) async {
     try {
       final result = await channel.invokeMethod<String>('connectToDevice', {
@@ -376,6 +649,28 @@ class _HomeScreenState extends State<HomeScreen> {
 
       setState(() {
         status = 'Error: ${e.message}';
+      });
+    }
+  }
+
+  Future<void> disconnectFromDevice(String address) async {
+    try {
+      final result = await channel.invokeMethod<String>('disconnectDevice', {
+        'address': address,
+      });
+
+      if (!mounted) return;
+
+      setState(() {
+        status = result ?? 'Device disconnected';
+      });
+
+      await loadConnectedDevices();
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Disconnect error: ${e.message}';
       });
     }
   }
@@ -398,18 +693,57 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  String? findAddressByDeviceId(String deviceId) {
+    for (final entry in peerIdsByAddress.entries) {
+      if (entry.value == deviceId && connectedAddresses.contains(entry.key)) {
+        return entry.key;
+      }
+    }
+
+    return null;
+  }
+
+  String? findNextHopAddress(String destinationId) {
+    final directAddress = findAddressByDeviceId(destinationId);
+
+    if (directAddress != null) {
+      return directAddress;
+    }
+
+    final relayAddress = reachablePeers[destinationId];
+
+    if (relayAddress != null && connectedAddresses.contains(relayAddress)) {
+      return relayAddress;
+    }
+
+    return null;
+  }
+
   Future<void> sendMessage() async {
     final text = messageController.text.trim();
 
-    final destinationId = receiverController.text.trim().isEmpty
-        ? peerDeviceId
-        : receiverController.text.trim();
+    final enteredReceiverId = receiverController.text.trim();
+
+    final destinationId = enteredReceiverId.isNotEmpty
+        ? enteredReceiverId
+        : connectedAddresses.length == 1
+        ? (peerIdsByAddress[connectedAddresses.first] ?? '')
+        : '';
+
+    final destinationAddress = findAddressByDeviceId(destinationId);
 
     if (text.isEmpty ||
         !isConnected ||
         sending ||
         localDeviceId.isEmpty ||
-        peerDeviceId.isEmpty) {
+        destinationId.isEmpty) {
+      return;
+    }
+
+    if (destinationAddress == null) {
+      setState(() {
+        status = 'Destination device is not directly connected';
+      });
       return;
     }
     setState(() {
@@ -423,7 +757,8 @@ class _HomeScreenState extends State<HomeScreen> {
         text: text,
       );
 
-      final result = await channel.invokeMethod<String>('sendMessage', {
+      final result = await channel.invokeMethod<String>('sendMessageToDevice', {
+        'address': destinationAddress,
         'message': message.toWireJson(),
       });
 
@@ -492,6 +827,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> loadConversations() async {
+    if (localDeviceId.isEmpty) return;
+
+    setState(() {
+      loadingConversations = true;
+    });
+
+    try {
+      final peerIds = await DatabaseHelper.instance.getConversationPeerIds(
+        localDeviceId,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        conversationPeerIds = peerIds;
+        loadingConversations = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        loadingConversations = false;
+        status = 'Failed to load conversations: $e';
+      });
+    }
+  }
+
   Future<void> loadMessagesFromDatabase() async {
     try {
       final savedMessages = await DatabaseHelper.instance.getAllMessages();
@@ -553,27 +916,55 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> saveRelayMessage(Message message) async {
+  Future<void> saveRelayMessage(Message message, String senderAddress) async {
     try {
+      if (message.hopCount >= maxHopCount) {
+        debugPrint('Hop limit reached: ${message.id}');
+        return;
+      }
+
       final relayMessage = message.copyWith(status: 'pending');
 
       final inserted = await DatabaseHelper.instance.insertMessage(
         relayMessage,
       );
 
-      await sendAck(message.id);
+      await sendAck(message.id, senderAddress);
 
-      if (inserted) {
-        debugPrint('Relay message saved: ${message.id}');
+      if (!inserted) {
+        debugPrint('Duplicate relay message: ${message.id}');
+        return;
+      }
 
-        debugPrint('Destination: ${message.receiverId}');
+      debugPrint('Relay message saved: ${message.id}');
+      debugPrint('Destination: ${message.receiverId}');
 
-        debugPrint('Hop count: ${message.hopCount}');
+      final destinationAddress = findAddressByDeviceId(message.receiverId);
+
+      if (destinationAddress == null) {
+        debugPrint('Destination is not connected. Message stored.');
+        return;
+      }
+
+      if (destinationAddress == senderAddress) {
+        debugPrint('Skipping sender to prevent routing loop');
+        return;
+      }
+
+      final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
+
+      final success = await sendPacketToDevice(
+        destinationAddress,
+        forwardedMessage.toWireJson(),
+      );
+
+      if (success) {
+        debugPrint('Message ${message.id} forwarded to ${message.receiverId}');
       } else {
-        debugPrint('Duplicate relay message ignored: ${message.id}');
+        debugPrint('Forwarding failed: ${message.id}');
       }
     } catch (e) {
-      debugPrint('Relay save error: $e');
+      debugPrint('Relay error: $e');
     }
   }
 
@@ -589,8 +980,12 @@ class _HomeScreenState extends State<HomeScreen> {
       await DatabaseHelper.instance.migrateLegacySenderId(id);
       await loadMessagesFromDatabase();
 
+      await loadConversations();
+
       if (isConnected) {
-        await sendHello();
+        for (final address in connectedAddresses) {
+          await sendHello(address);
+        }
       }
     } catch (e) {
       if (!mounted) return;
@@ -598,6 +993,380 @@ class _HomeScreenState extends State<HomeScreen> {
         status = 'Device identity error: $e';
       });
     }
+  }
+
+  Future<void> openConversation(String peerId) async {
+    messageController.clear();
+
+    setState(() {
+      selectedPeerId = peerId;
+      conversationMessages = [];
+      loadingMessages = true;
+    });
+
+    try {
+      final savedMessages = await DatabaseHelper.instance.getConversation(
+        localDeviceId,
+        peerId,
+      );
+
+      if (!mounted || selectedPeerId != peerId) return;
+
+      setState(() {
+        conversationMessages = savedMessages;
+        loadingMessages = false;
+      });
+    } catch (e) {
+      if (!mounted || selectedPeerId != peerId) return;
+
+      setState(() {
+        loadingMessages = false;
+        status = 'Failed to load conversation: $e';
+      });
+    }
+  }
+
+  Future<void> sendConversationMessage() async {
+    final peerId = selectedPeerId;
+    final text = messageController.text.trim();
+
+    if (peerId == null || text.isEmpty || sending || localDeviceId.isEmpty) {
+      return;
+    }
+
+    final nextHopAddress = findNextHopAddress(peerId);
+
+    if (nextHopAddress == null) {
+      setState(() {
+        status = 'No available route to destination';
+      });
+      return;
+    }
+
+    final isDirectConnection = findAddressByDeviceId(peerId) != null;
+
+    setState(() {
+      sending = true;
+    });
+
+    try {
+      final message = Message.create(
+        senderId: localDeviceId,
+        receiverId: peerId,
+        text: text,
+      );
+
+      final success = await sendPacketToDevice(
+        nextHopAddress,
+        message.toWireJson(),
+      );
+
+      if (!mounted) return;
+
+      if (success) {
+        final savedMessage = message.copyWith(status: 'sent');
+
+        await DatabaseHelper.instance.insertMessage(savedMessage);
+
+        if (!mounted) return;
+
+        setState(() {
+          if (selectedPeerId == peerId) {
+            conversationMessages.add(savedMessage);
+            messageController.clear();
+          }
+
+          status = isDirectConnection
+              ? 'Message sent directly'
+              : 'Message sent to relay';
+        });
+
+        await loadConversations();
+      } else {
+        setState(() {
+          status = 'Failed to send message';
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        status = 'Send error: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          sending = false;
+        });
+      }
+    }
+  }
+
+  Widget buildConversationTab() {
+    final peerId = selectedPeerId;
+
+    if (peerId == null) {
+      return buildChatsTab();
+    }
+
+    if (loadingMessages) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Column(
+      children: [
+        ListTile(
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () {
+              setState(() {
+                selectedPeerId = null;
+                conversationMessages = [];
+              });
+
+              loadConversations();
+            },
+          ),
+          title: Text('Device ${peerId.substring(0, 8)}'),
+          subtitle: Text(
+            connectedAddresses.any(
+                  (address) => peerIdsByAddress[address] == peerId,
+                )
+                ? 'Connected'
+                : 'Offline',
+          ),
+        ),
+
+        const Divider(height: 1),
+
+        Expanded(
+          child: conversationMessages.isEmpty
+              ? const Center(child: Text('No messages yet'))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: conversationMessages.length,
+                  itemBuilder: (context, index) {
+                    final message = conversationMessages[index];
+
+                    final isMine = message.senderId == localDeviceId;
+
+                    return Align(
+                      alignment: isMine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 280),
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: isMine
+                              ? Colors.blue.shade100
+                              : Colors.grey.shade200,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(message.text),
+
+                            const SizedBox(height: 4),
+
+                            Text(
+                              '${message.createdAt.toLocal().hour.toString().padLeft(2, '0')}:'
+                              '${message.createdAt.toLocal().minute.toString().padLeft(2, '0')}',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.black54,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: messageController,
+                  enabled: !sending && findNextHopAddress(peerId) != null,
+                  textInputAction: TextInputAction.send,
+                  onSubmitted: (_) => sendConversationMessage(),
+                  decoration: const InputDecoration(
+                    hintText: 'Type a message...',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                onPressed: sending || findNextHopAddress(peerId) == null
+                    ? null
+                    : sendConversationMessage,
+                icon: const Icon(Icons.send),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> showNewChatDialog() async {
+    final directPeers = peerIdsByAddress.entries
+        .where(
+          (entry) =>
+              connectedAddresses.contains(entry.key) && entry.value.isNotEmpty,
+        )
+        .toList();
+
+    final indirectPeers = reachablePeers.entries
+        .where(
+          (entry) =>
+              connectedAddresses.contains(entry.value) &&
+              findAddressByDeviceId(entry.key) == null,
+        )
+        .toList();
+
+    final peerId = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('New Chat'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                if (directPeers.isNotEmpty) ...[
+                  const Text(
+                    'Direct connections',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  for (final peer in directPeers)
+                    ListTile(
+                      leading: const Icon(Icons.bluetooth_connected),
+                      title: Text('Device ${peer.value.substring(0, 8)}'),
+                      subtitle: const Text('Direct connection'),
+                      onTap: () {
+                        Navigator.pop(dialogContext, peer.value);
+                      },
+                    ),
+                ],
+
+                if (indirectPeers.isNotEmpty) ...[
+                  const Divider(),
+                  const Text(
+                    'Available through relay',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  for (final peer in indirectPeers)
+                    ListTile(
+                      leading: const Icon(Icons.route),
+                      title: Text('Device ${peer.key.substring(0, 8)}'),
+                      subtitle: Text(
+                        'Via ${peerIdsByAddress[peer.value] ?? peer.value}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      onTap: () {
+                        Navigator.pop(dialogContext, peer.key);
+                      },
+                    ),
+                ],
+
+                if (directPeers.isEmpty && indirectPeers.isEmpty)
+                  const Text(
+                    'No devices discovered. '
+                    'Connect nearby devices first.',
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || peerId == null) return;
+
+    await openConversation(peerId);
+  }
+
+  Widget buildChatsTab() {
+    if (loadingConversations) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (conversationPeerIds.isEmpty) {
+      return const Center(child: Text('No conversations yet'));
+    }
+
+    return ListView.builder(
+      itemCount: conversationPeerIds.length,
+      itemBuilder: (context, index) {
+        final peerId = conversationPeerIds[index];
+
+        return FutureBuilder<Message?>(
+          future: DatabaseHelper.instance.getLastConversationMessage(
+            localDeviceId,
+            peerId,
+          ),
+          builder: (context, snapshot) {
+            final lastMessage = snapshot.data;
+
+            String subtitle = 'No messages yet';
+            String time = '';
+
+            if (lastMessage != null) {
+              final isMine = lastMessage.senderId == localDeviceId;
+
+              subtitle = isMine ? 'You: ${lastMessage.text}' : lastMessage.text;
+
+              final localTime = lastMessage.createdAt.toLocal();
+
+              time =
+                  '${localTime.hour.toString().padLeft(2, '0')}:'
+                  '${localTime.minute.toString().padLeft(2, '0')}';
+            }
+
+            return ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.person)),
+              title: Text('Device ${peerId.substring(0, 8)}'),
+              subtitle: Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    time,
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const Icon(Icons.chevron_right),
+                ],
+              ),
+              onTap: () {
+                openConversation(peerId);
+              },
+            );
+          },
+        );
+      },
+    );
   }
 
   @override
@@ -612,204 +1381,321 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('MultiHop Messenger')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          const Text(
-            'My Device ID:',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 12),
-
-          TextField(
-            controller: receiverController,
-            decoration: const InputDecoration(
-              labelText: 'Destination UUID',
-              hintText: 'Enter receiver device UUID',
-              border: OutlineInputBorder(),
+      appBar: AppBar(
+        title: const Text('MultiHop Messenger'),
+        actions: [
+          if (selectedTab == 0 && selectedPeerId == null)
+            IconButton(
+              icon: const Icon(Icons.add_comment_outlined),
+              tooltip: 'New Chat',
+              onPressed: showNewChatDialog,
             ),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: selectedTab,
+        onDestinationSelected: (index) {
+          setState(() {
+            selectedTab = index;
+          });
+
+          if (index == 0) {
+            loadConversations();
+          }
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.chat_bubble_outline),
+            selectedIcon: Icon(Icons.chat_bubble),
+            label: 'Chats',
           ),
-
-          const SizedBox(height: 8),
-
-          SelectableText(localDeviceId.isEmpty ? 'Loading...' : localDeviceId),
-          const SizedBox(height: 8),
-          const Text(
-            'Connected Peer UUID:',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-
-          SelectableText(
-            peerDeviceId.isEmpty ? 'Not received yet' : peerDeviceId,
-          ),
-          const Divider(height: 30),
-          const Icon(Icons.bluetooth, size: 55, color: Colors.blue),
-
-          const SizedBox(height: 8),
-
-          Text(status, textAlign: TextAlign.center),
-
-          const SizedBox(height: 12),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('checkBluetooth'),
-            child: const Text('Check Bluetooth'),
-          ),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('requestBluetoothPermission'),
-            child: const Text('Request Bluetooth Permission'),
-          ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Bluetooth Server',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('startServer'),
-            child: const Text('Start Server'),
-          ),
-
-          ElevatedButton(
-            onPressed: () => callKotlin('stopServer'),
-            child: const Text('Stop Server'),
-          ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Bluetooth Client',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          ElevatedButton(
-            onPressed: loadPairedDevices,
-            child: const Text('Show Paired Devices'),
-          ),
-
-          for (final device in pairedDevices)
-            Card(
-              child: ListTile(
-                leading: const Icon(Icons.smartphone),
-                title: Text(device.name),
-                subtitle: Text(device.address),
-                trailing: IconButton(
-                  icon: const Icon(Icons.link),
-                  onPressed: () => connectToDevice(device.address),
+          NavigationDestination(icon: Icon(Icons.bluetooth), label: 'Devices'),
+        ],
+      ),
+      body: selectedTab == 0
+          ? (selectedPeerId == null ? buildChatsTab() : buildConversationTab())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                const Text(
+                  'My Device ID:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-              ),
-            ),
 
-          const Divider(height: 30),
+                const SizedBox(height: 12),
 
-          const Text(
-            'Connection Status',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 8),
-
-          Text(connectionStatus, textAlign: TextAlign.center),
-
-          ElevatedButton(
-            onPressed: refreshConnectionStatus,
-            child: const Text('Refresh Connection Status'),
-          ),
-
-          ElevatedButton(
-            onPressed: () async {
-              await callKotlin('disconnect');
-              await refreshConnectionStatus();
-            },
-            child: const Text('Disconnect'),
-          ),
-
-          const SizedBox(height: 12),
-
-          ElevatedButton(
-            onPressed: testDatabase,
-            child: const Text('Test SQLite'),
-          ),
-
-          const Divider(height: 30),
-
-          const Text(
-            'Bluetooth Chat',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-
-          const SizedBox(height: 12),
-
-          Container(
-            height: 260,
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.grey.shade300),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: messages.isEmpty
-                ? const Center(child: Text('No messages yet'))
-                : ListView.builder(
-                    controller: scrollController,
-                    itemCount: messages.length,
-                    itemBuilder: (context, index) {
-                      final message = messages[index];
-
-                      return Align(
-                        alignment: message.isMine
-                            ? Alignment.centerRight
-                            : Alignment.centerLeft,
-                        child: Container(
-                          constraints: const BoxConstraints(maxWidth: 260),
-                          margin: const EdgeInsets.symmetric(vertical: 4),
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: message.isMine
-                                ? Colors.blue.shade100
-                                : Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Text(message.text),
-                        ),
-                      );
-                    },
-                  ),
-          ),
-
-          const SizedBox(height: 12),
-
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: messageController,
-                  enabled: isConnected,
-                  textInputAction: TextInputAction.send,
-                  onSubmitted: (_) => sendMessage(),
+                TextField(
+                  controller: receiverController,
                   decoration: const InputDecoration(
-                    hintText: 'Type a message...',
+                    labelText: 'Destination UUID',
+                    hintText: 'Enter receiver device UUID',
                     border: OutlineInputBorder(),
                   ),
                 ),
-              ),
 
-              const SizedBox(width: 8),
+                const SizedBox(height: 8),
 
-              IconButton.filled(
-                onPressed: isConnected && !sending ? sendMessage : null,
-                icon: const Icon(Icons.send),
-              ),
-            ],
-          ),
+                SelectableText(
+                  localDeviceId.isEmpty ? 'Loading...' : localDeviceId,
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Connected Peer UUID:',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
 
-          const SizedBox(height: 20),
-        ],
-      ),
+                if (peerIdsByAddress.isEmpty)
+                  const Text('No peer UUIDs received yet'),
+
+                for (final entry in peerIdsByAddress.entries)
+                  ListTile(
+                    dense: true,
+                    title: SelectableText(entry.value),
+                    subtitle: Text('Bluetooth: ${entry.key}'),
+                  ),
+
+                const Divider(height: 30),
+                const Icon(Icons.bluetooth, size: 55, color: Colors.blue),
+
+                const SizedBox(height: 8),
+
+                Text(status, textAlign: TextAlign.center),
+
+                const SizedBox(height: 12),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('checkBluetooth'),
+                  child: const Text('Check Bluetooth'),
+                ),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('requestBluetoothPermission'),
+                  child: const Text('Request Bluetooth Permission'),
+                ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Bluetooth Server',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('startServer'),
+                  child: const Text('Start Server'),
+                ),
+
+                ElevatedButton(
+                  onPressed: () => callKotlin('stopServer'),
+                  child: const Text('Stop Server'),
+                ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Nearby Bluetooth Devices',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 12),
+
+                ElevatedButton.icon(
+                  onPressed: isScanning ? null : scanNearbyDevices,
+                  icon: const Icon(Icons.bluetooth_searching),
+                  label: Text(isScanning ? 'Scanning...' : 'Scan Nearby'),
+                ),
+
+                ElevatedButton.icon(
+                  onPressed: () => callKotlin('requestDiscoverable'),
+                  icon: const Icon(Icons.visibility),
+                  label: const Text('Make My Device Visible'),
+                ),
+
+                const SizedBox(height: 12),
+
+                for (final device in discoveredDevices)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.smartphone),
+                      title: Text(device.name),
+                      subtitle: Text(device.address),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.link),
+                        onPressed: () => connectToDevice(device.address),
+                      ),
+                    ),
+                  ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Bluetooth Client',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                ElevatedButton(
+                  onPressed: loadPairedDevices,
+                  child: const Text('Show Paired Devices'),
+                ),
+
+                for (final device in pairedDevices)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.smartphone),
+                      title: Text(device.name),
+                      subtitle: Text(device.address),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.link),
+                        onPressed: () => connectToDevice(device.address),
+                      ),
+                    ),
+                  ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Connected Devices',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 12),
+
+                if (connectedAddresses.isEmpty)
+                  const Text('No connected devices'),
+
+                for (final address in connectedAddresses)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(
+                        Icons.bluetooth_connected,
+                        color: Colors.green,
+                      ),
+                      title: Text(
+                        address,
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                      subtitle: const Text('Connected'),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.link_off),
+                        tooltip: 'Disconnect',
+                        onPressed: () => disconnectFromDevice(address),
+                      ),
+                    ),
+                  ),
+
+                const SizedBox(height: 12),
+
+                const Text(
+                  'Connection Status',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 8),
+
+                Text(connectionStatus, textAlign: TextAlign.center),
+
+                ElevatedButton(
+                  onPressed: refreshConnectionStatus,
+                  child: const Text('Refresh Connection Status'),
+                ),
+
+                ElevatedButton(
+                  onPressed: () async {
+                    await callKotlin('disconnect');
+                    await loadConnectedDevices();
+
+                    if (!mounted) return;
+
+                    setState(() {
+                      peerIdsByAddress.clear();
+                    });
+                  },
+                  child: const Text('Disconnect'),
+                ),
+
+                const SizedBox(height: 12),
+
+                ElevatedButton(
+                  onPressed: testDatabase,
+                  child: const Text('Test SQLite'),
+                ),
+
+                const Divider(height: 30),
+
+                const Text(
+                  'Bluetooth Chat',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                ),
+
+                const SizedBox(height: 12),
+
+                Container(
+                  height: 260,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade300),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: messages.isEmpty
+                      ? const Center(child: Text('No messages yet'))
+                      : ListView.builder(
+                          controller: scrollController,
+                          itemCount: messages.length,
+                          itemBuilder: (context, index) {
+                            final message = messages[index];
+
+                            return Align(
+                              alignment: message.isMine
+                                  ? Alignment.centerRight
+                                  : Alignment.centerLeft,
+                              child: Container(
+                                constraints: const BoxConstraints(
+                                  maxWidth: 260,
+                                ),
+                                margin: const EdgeInsets.symmetric(vertical: 4),
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: message.isMine
+                                      ? Colors.blue.shade100
+                                      : Colors.grey.shade200,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(message.text),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+
+                const SizedBox(height: 12),
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: messageController,
+                        enabled: isConnected,
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => sendMessage(),
+                        decoration: const InputDecoration(
+                          hintText: 'Type a message...',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(width: 8),
+
+                    IconButton.filled(
+                      onPressed: isConnected && !sending ? sendMessage : null,
+                      icon: const Icon(Icons.send),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 20),
+              ],
+            ),
     );
   }
 }
