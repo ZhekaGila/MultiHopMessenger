@@ -9,6 +9,8 @@ import 'services/device_identity.dart';
 
 import 'dart:convert';
 
+part 'widgets/devices_tab.dart';
+
 void main() {
   runApp(const MultiHopApp());
 }
