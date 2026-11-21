@@ -30,6 +30,9 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  final RoutingService routingService = RoutingService.instance;
+  final MessageService messageService = MessageService.instance;
+
   final bluetoothService = BluetoothService.instance;
 
   final messageController = TextEditingController();
@@ -117,17 +120,14 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final peers = peerIdsByAddress.entries
-        .where(
-          (entry) =>
-              connectedAddresses.contains(entry.key) &&
-              entry.key != address &&
-              entry.value.isNotEmpty,
-        )
-        .map((entry) => entry.value)
-        .toList();
+    final packet = routingService.createPeersPacket(
+      localDeviceId: localDeviceId,
+      targetAddress: address,
+      peerIdsByAddress: peerIdsByAddress,
+      connectedAddresses: connectedAddresses,
+    );
 
-    final packet = {'type': 'peers', 'deviceId': localDeviceId, 'peers': peers};
+    final peers = packet['peers'];
 
     final success = await sendPacketToDevice(address, jsonEncode(packet));
 
@@ -143,7 +143,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final helloPacket = {'type': 'hello', 'deviceId': localDeviceId};
+    final helloPacket = routingService.createHelloPacket(localDeviceId);
 
     final success = await sendPacketToDevice(address, jsonEncode(helloPacket));
 
@@ -157,11 +157,10 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final ackPacket = {
-      'type': 'ack',
-      'messageId': messageId,
-      'deviceId': localDeviceId,
-    };
+    final ackPacket = messageService.createAckPacket(
+      messageId: messageId,
+      deviceId: localDeviceId,
+    );
 
     final success = await sendPacketToDevice(
       senderAddress,
@@ -310,39 +309,32 @@ class _HomeScreenState extends State<HomeScreen> {
       final packetType = data['type'];
 
       if (packetType == 'peers') {
-        final senderDeviceId = data['deviceId'];
-        final receivedPeers = data['peers'];
+        final updatedRoutes = routingService.processPeersPacket(
+          senderAddress: senderAddress,
+          senderDeviceId: data['deviceId'] is String
+              ? data['deviceId'] as String
+              : null,
+          receivedPeers: data['peers'],
+          localDeviceId: localDeviceId,
+          peerIdsByAddress: peerIdsByAddress,
+          reachablePeers: reachablePeers,
+          connectedAddresses: connectedAddresses,
+        );
 
-        if (!connectedAddresses.contains(senderAddress) ||
-            senderDeviceId is! String ||
-            peerIdsByAddress[senderAddress] != senderDeviceId ||
-            receivedPeers is! List) {
+        if (updatedRoutes == null) {
           debugPrint('Invalid PEERS packet');
           return;
         }
 
-        final peerIds = receivedPeers
-            .whereType<String>()
-            .where(
-              (id) =>
-                  id.isNotEmpty && id != localDeviceId && id != senderDeviceId,
-            )
-            .toSet();
+        if (!mounted) return;
 
         setState(() {
-          reachablePeers.removeWhere(
-            (deviceId, nextHopAddress) => nextHopAddress == senderAddress,
-          );
-
-          for (final peerId in peerIds) {
-            if (findAddressByDeviceId(peerId) == null) {
-              reachablePeers[peerId] = senderAddress;
-            }
-          }
+          reachablePeers
+            ..clear()
+            ..addAll(updatedRoutes);
         });
 
-        debugPrint('Reachable peers via $senderAddress: $peerIds');
-
+        debugPrint('Reachable peers updated: $reachablePeers');
         return;
       }
 
@@ -662,29 +654,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String? findAddressByDeviceId(String deviceId) {
-    for (final entry in peerIdsByAddress.entries) {
-      if (entry.value == deviceId && connectedAddresses.contains(entry.key)) {
-        return entry.key;
-      }
-    }
-
-    return null;
+    return routingService.findDirectAddress(
+      deviceId: deviceId,
+      peerIdsByAddress: peerIdsByAddress,
+      connectedAddresses: connectedAddresses,
+    );
   }
 
   String? findNextHopAddress(String destinationId) {
-    final directAddress = findAddressByDeviceId(destinationId);
-
-    if (directAddress != null) {
-      return directAddress;
-    }
-
-    final relayAddress = reachablePeers[destinationId];
-
-    if (relayAddress != null && connectedAddresses.contains(relayAddress)) {
-      return relayAddress;
-    }
-
-    return null;
+    return routingService.findNextHop(
+      destinationId: destinationId,
+      peerIdsByAddress: peerIdsByAddress,
+      reachablePeers: reachablePeers,
+      connectedAddresses: connectedAddresses,
+    );
   }
 
   Future<void> sendMessage() async {
