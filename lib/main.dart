@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'database/database_helper.dart';
 import 'models/message.dart';
 import 'services/device_identity.dart';
+import 'services/bluetooth_service.dart';
 
 import 'dart:convert';
 

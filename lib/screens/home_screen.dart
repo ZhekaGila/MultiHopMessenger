@@ -30,9 +30,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  static const channel = MethodChannel('multihop/bluetooth');
-
-  static const eventChannel = EventChannel('multihop/bluetooth_events');
+  final bluetoothService = BluetoothService.instance;
 
   final messageController = TextEditingController();
   final receiverController = TextEditingController();
@@ -84,7 +82,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     loadConnectedDevices();
 
-    eventSubscription = eventChannel.receiveBroadcastStream().listen(
+    eventSubscription = bluetoothService.listenToEvents(
       handleBluetoothEvent,
       onError: (Object error) {
         if (!mounted) return;
@@ -102,10 +100,10 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     try {
-      final result = await channel.invokeMethod<String>('sendMessageToDevice', {
-        'address': address,
-        'message': packet,
-      });
+      final result = await bluetoothService.invokeString(
+        'sendMessageToDevice',
+        {'address': address, 'message': packet},
+      );
 
       return result == 'Message sent';
     } on PlatformException catch (e) {
@@ -508,7 +506,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> callKotlin(String method) async {
     try {
-      final result = await channel.invokeMethod<String>(method);
+      final result = await bluetoothService.invokeString(method);
 
       if (!mounted) return;
 
@@ -534,7 +532,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      final result = await channel.invokeMethod<String>('startDiscovery');
+      final result = await bluetoothService.startDiscovery();
 
       if (!mounted) return;
 
@@ -557,9 +555,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> loadPairedDevices() async {
     try {
-      final result = await channel.invokeMethod<List<dynamic>>(
-        'getPairedDevices',
-      );
+      final result = await bluetoothService.getPairedDevices();
 
       if (!mounted) return;
 
@@ -585,9 +581,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> loadConnectedDevices() async {
     try {
-      final result = await channel.invokeMethod<List<dynamic>>(
-        'getConnectedDevices',
-      );
+      final result = await bluetoothService.getConnectedDevices();
 
       if (!mounted) return;
 
@@ -613,9 +607,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> connectToDevice(String address) async {
     try {
-      final result = await channel.invokeMethod<String>('connectToDevice', {
-        'address': address,
-      });
+      final result = await bluetoothService.connectToDevice(address);
 
       if (!mounted) return;
 
@@ -633,9 +625,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> disconnectFromDevice(String address) async {
     try {
-      final result = await channel.invokeMethod<String>('disconnectDevice', {
-        'address': address,
-      });
+      final result = await bluetoothService.disconnectDevice(address);
 
       if (!mounted) return;
 
@@ -655,7 +645,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> refreshConnectionStatus() async {
     try {
-      final result = await channel.invokeMethod<String>('getConnectionStatus');
+      final result = await bluetoothService.getConnectionStatus();
 
       if (!mounted) return;
 
@@ -735,10 +725,10 @@ class _HomeScreenState extends State<HomeScreen> {
         text: text,
       );
 
-      final result = await channel.invokeMethod<String>('sendMessageToDevice', {
-        'address': destinationAddress,
-        'message': message.toWireJson(),
-      });
+      final result = await bluetoothService.invokeString(
+        'sendMessageToDevice',
+        {'address': destinationAddress, 'message': message.toWireJson()},
+      );
 
       if (!mounted) return;
 
