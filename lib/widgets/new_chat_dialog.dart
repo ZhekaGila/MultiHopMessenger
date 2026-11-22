@@ -12,7 +12,7 @@ extension _NewChatDialogBuilder on _HomeScreenState {
     final indirectPeers = reachablePeers.entries
         .where(
           (entry) =>
-              connectedAddresses.contains(entry.value) &&
+              connectedAddresses.contains(entry.value.nextHopAddress) &&
               findAddressByDeviceId(entry.key) == null,
         )
         .toList();
@@ -54,7 +54,8 @@ extension _NewChatDialogBuilder on _HomeScreenState {
                       leading: const Icon(Icons.route),
                       title: Text('Device ${peer.key.substring(0, 8)}'),
                       subtitle: Text(
-                        'Via ${peerIdsByAddress[peer.value] ?? peer.value}',
+                        'Via ${peerIdsByAddress[peer.value.nextHopAddress] ?? peer.value.nextHopAddress} '
+                        '(${peer.value.hopCount} hops)',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),

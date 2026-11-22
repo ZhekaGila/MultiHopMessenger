@@ -33,6 +33,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final RoutingService routingService = RoutingService.instance;
   final MessageService messageService = MessageService.instance;
   final NetworkLogger networkLogger = NetworkLogger.instance;
+  final EncryptionService encryptionService = EncryptionService.instance;
 
   final bluetoothService = BluetoothService.instance;
 
@@ -72,7 +73,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final Map<String, String> peerIdsByAddress = {};
 
-  final Map<String, String> reachablePeers = {};
+  final Map<String, RouteEntry> reachablePeers = {};
 
   static const int maxHopCount = 5;
 
@@ -156,6 +157,39 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('PEERS sent to $address: $peers');
     } else {
       debugPrint('PEERS failed for $address');
+    }
+  }
+
+  Future<void> sendRoutes(String address) async {
+    if (!connectedAddresses.contains(address) || localDeviceId.isEmpty) {
+      return;
+    }
+
+    final packet = routingService.createRoutesPacket(
+      localDeviceId: localDeviceId,
+      targetAddress: address,
+      peerIdsByAddress: peerIdsByAddress,
+      knownRoutes: reachablePeers,
+      connectedAddresses: connectedAddresses,
+      maxHopCount: maxHopCount,
+    );
+
+    final success = await sendPacketToDevice(address, jsonEncode(packet));
+
+    if (success) {
+      debugPrint('ROUTES sent to $address: ${packet['routes']}');
+    } else {
+      debugPrint('ROUTES failed for $address');
+    }
+  }
+
+  Future<void> broadcastRoutes() async {
+    for (final address in List<String>.from(connectedAddresses)) {
+      if (peerIdsByAddress[address] == null) {
+        continue;
+      }
+
+      await sendRoutes(address);
     }
   }
 
@@ -255,7 +289,26 @@ class _HomeScreenState extends State<HomeScreen> {
     String senderAddress,
   ) async {
     try {
-      final savedMessage = message.copyWith(status: 'received');
+      final encryptedData = jsonDecode(message.text);
+
+      if (encryptedData is! Map<String, dynamic>) {
+        throw const FormatException('Invalid encrypted message');
+      }
+
+      final decryptedText = await encryptionService.decrypt(
+        encryptedData.map((key, value) => MapEntry(key, value.toString())),
+        encryptionService.demoKey,
+      );
+
+      final savedMessage = Message(
+        id: message.id,
+        senderId: message.senderId,
+        receiverId: message.receiverId,
+        text: decryptedText,
+        createdAt: message.createdAt,
+        status: 'received',
+        hopCount: message.hopCount,
+      );
 
       final inserted = await DatabaseHelper.instance.insertMessage(
         savedMessage,
@@ -297,28 +350,35 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> forwardMessagesToPeer(String address) async {
-    final destinationId = peerIdsByAddress[address];
-
-    if (!connectedAddresses.contains(address) ||
-        destinationId == null ||
-        destinationId.isEmpty) {
+    if (!connectedAddresses.contains(address)) {
       return;
     }
 
-    final pendingMessages = await DatabaseHelper.instance
-        .getMessagesForReceiver(destinationId);
+    final peerId = peerIdsByAddress[address];
+
+    if (peerId == null || peerId.isEmpty) {
+      return;
+    }
+
+    final pendingMessages = await DatabaseHelper.instance.getPendingMessages();
 
     for (final message in pendingMessages) {
       if (!connectedAddresses.contains(address)) {
         break;
       }
 
-      if (message.senderId == localDeviceId) {
+      if (message.receiverId == localDeviceId) {
         continue;
       }
 
       if (message.hopCount >= maxHopCount) {
         debugPrint('Hop limit reached: ${message.id}');
+        continue;
+      }
+
+      final nextHopAddress = findNextHopAddress(message.receiverId);
+
+      if (nextHopAddress != address) {
         continue;
       }
 
@@ -330,18 +390,18 @@ class _HomeScreenState extends State<HomeScreen> {
       );
 
       if (success) {
-        debugPrint('Forwarded message ${message.id} to $destinationId');
-
         networkLogger.log(
           eventType: 'FORWARD',
           deviceId: localDeviceId,
           messageId: message.id,
-          peerId: peerIdsByAddress[address],
-          hopCount: message.hopCount + 1,
-          details: 'Forwarded to $address',
+          peerId: peerId,
+          hopCount: forwardedMessage.hopCount,
+          details: 'Stored message forwarded to $address',
         );
+
+        debugPrint('Stored message ${message.id} forwarded to $peerId');
       } else {
-        debugPrint('Forwarding failed: ${message.id}');
+        debugPrint('Failed to forward stored message ${message.id}');
         break;
       }
     }
@@ -366,25 +426,44 @@ class _HomeScreenState extends State<HomeScreen> {
         details: 'Packet type: $packetType; from: $senderAddress',
       );
 
-      if (packetType == 'peers') {
-        final updatedRoutes = routingService.processPeersPacket(
+      if (packetType == 'routes') {
+        final updatedRoutes = routingService.processRoutePacket(
           senderAddress: senderAddress,
           senderDeviceId: data['deviceId'] is String
               ? data['deviceId'] as String
               : null,
-          receivedPeers: data['peers'],
+          receivedRoutes: data['routes'],
           localDeviceId: localDeviceId,
           peerIdsByAddress: peerIdsByAddress,
-          reachablePeers: reachablePeers,
+          knownRoutes: reachablePeers,
           connectedAddresses: connectedAddresses,
+          maxHopCount: maxHopCount,
         );
 
         if (updatedRoutes == null) {
-          debugPrint('Invalid PEERS packet');
+          debugPrint('Invalid ROUTES packet');
           return;
         }
 
-        if (!mounted) return;
+        bool routesChanged = updatedRoutes.length != reachablePeers.length;
+
+        if (!routesChanged) {
+          for (final entry in updatedRoutes.entries) {
+            final oldRoute = reachablePeers[entry.key];
+            final newRoute = entry.value;
+
+            if (oldRoute == null ||
+                oldRoute.nextHopAddress != newRoute.nextHopAddress ||
+                oldRoute.hopCount != newRoute.hopCount) {
+              routesChanged = true;
+              break;
+            }
+          }
+        }
+
+        if (!routesChanged || !mounted) {
+          return;
+        }
 
         setState(() {
           reachablePeers
@@ -392,7 +471,23 @@ class _HomeScreenState extends State<HomeScreen> {
             ..addAll(updatedRoutes);
         });
 
-        debugPrint('Reachable peers updated: $reachablePeers');
+        debugPrint('Routing table updated:');
+
+        for (final route in reachablePeers.values) {
+          debugPrint(
+            '${route.destinationId} -> '
+            '${route.nextHopAddress} '
+            '(${route.hopCount} hops)',
+          );
+        }
+
+        broadcastRoutes();
+
+        for (final address in List<String>.from(connectedAddresses)) {
+          if (peerIdsByAddress[address] != null) {
+            forwardMessagesToPeer(address);
+          }
+        }
 
         return;
       }
@@ -410,13 +505,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
           forwardMessagesToPeer(senderAddress);
 
-          sendPeers(senderAddress);
-
-          for (final address in connectedAddresses) {
-            if (address != senderAddress) {
-              sendPeers(address);
-            }
-          }
+          broadcastRoutes();
         }
 
         return;
@@ -515,7 +604,7 @@ class _HomeScreenState extends State<HomeScreen> {
           peerIdsByAddress.remove(address);
 
           reachablePeers.removeWhere(
-            (deviceId, nextHopAddress) => nextHopAddress == address,
+            (deviceId, route) => route.nextHopAddress == address,
           );
         });
       }
@@ -527,7 +616,11 @@ class _HomeScreenState extends State<HomeScreen> {
         details: 'Bluetooth disconnected: $address',
       );
 
-      loadConnectedDevices();
+      loadConnectedDevices().then((_) {
+        if (mounted) {
+          broadcastRoutes();
+        }
+      });
 
       return;
     }
@@ -736,12 +829,23 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String? findNextHopAddress(String destinationId) {
-    return routingService.findNextHop(
-      destinationId: destinationId,
-      peerIdsByAddress: peerIdsByAddress,
-      reachablePeers: reachablePeers,
-      connectedAddresses: connectedAddresses,
-    );
+    final directAddress = findAddressByDeviceId(destinationId);
+
+    if (directAddress != null) {
+      return directAddress;
+    }
+
+    final route = reachablePeers[destinationId];
+
+    if (route == null) {
+      return null;
+    }
+
+    if (!connectedAddresses.contains(route.nextHopAddress)) {
+      return null;
+    }
+
+    return route.nextHopAddress;
   }
 
   Future<void> sendMessage() async {
@@ -964,14 +1068,16 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('Relay message saved: ${message.id}');
       debugPrint('Destination: ${message.receiverId}');
 
-      final destinationAddress = findAddressByDeviceId(message.receiverId);
+      // Find the next hop using the routing table.
+      final nextHopAddress = findNextHopAddress(message.receiverId);
 
-      if (destinationAddress == null) {
-        debugPrint('Destination is not connected. Message stored.');
+      if (nextHopAddress == null) {
+        debugPrint('No route available. Message stored.');
         return;
       }
 
-      if (destinationAddress == senderAddress) {
+      // Avoid immediately forwarding back to the sender.
+      if (nextHopAddress == senderAddress) {
         debugPrint('Skipping sender to prevent routing loop');
         return;
       }
@@ -979,12 +1085,21 @@ class _HomeScreenState extends State<HomeScreen> {
       final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
 
       final success = await sendPacketToDevice(
-        destinationAddress,
+        nextHopAddress,
         forwardedMessage.toWireJson(),
       );
 
       if (success) {
-        debugPrint('Message ${message.id} forwarded to ${message.receiverId}');
+        networkLogger.log(
+          eventType: 'FORWARD',
+          deviceId: localDeviceId,
+          messageId: message.id,
+          peerId: peerIdsByAddress[nextHopAddress],
+          hopCount: forwardedMessage.hopCount,
+          details: 'Forwarded to $nextHopAddress',
+        );
+
+        debugPrint('Message ${message.id} forwarded to $nextHopAddress');
       } else {
         debugPrint('Forwarding failed: ${message.id}');
       }
@@ -1075,10 +1190,21 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
+      final encrypted = await encryptionService.encrypt(
+        text,
+        encryptionService.demoKey,
+      );
+
+      final encryptedPayload = jsonEncode({
+        'ciphertext': encrypted['ciphertext'],
+        'nonce': encrypted['nonce'],
+        'mac': encrypted['mac'],
+      });
+
       final message = Message.create(
         senderId: localDeviceId,
         receiverId: peerId,
-        text: text,
+        text: encryptedPayload,
       );
 
       final success = await sendPacketToDevice(
@@ -1089,7 +1215,15 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
 
       if (success) {
-        final savedMessage = message.copyWith(status: 'sent');
+        final savedMessage = Message(
+          id: message.id,
+          senderId: message.senderId,
+          receiverId: message.receiverId,
+          text: text,
+          createdAt: message.createdAt,
+          status: 'sent',
+          hopCount: message.hopCount,
+        );
 
         await DatabaseHelper.instance.insertMessage(savedMessage);
 

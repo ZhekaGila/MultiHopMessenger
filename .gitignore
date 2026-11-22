@@ -84,3 +84,5 @@ google-services.json
 # Android Profiling
 *.hprof
 >>>>>>> a38bde79416ab47cc58633db6ad46f58037e968d
+
+devtools_options.yaml
