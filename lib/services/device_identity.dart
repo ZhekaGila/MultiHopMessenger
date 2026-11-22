@@ -4,13 +4,12 @@ import 'package:uuid/uuid.dart';
 class DeviceIdentity {
   static const String _deviceIdKey = 'device_uuid';
 
-
-  static Future<String> getOrCreateDeviceId() async{
+  static Future<String> getOrCreateDeviceId() async {
     final prefs = await SharedPreferences.getInstance();
 
     final savedId = prefs.getString(_deviceIdKey);
 
-    if (savedId != null && savedId.isNotEmpty){
+    if (savedId != null && savedId.isNotEmpty) {
       return savedId;
     }
 

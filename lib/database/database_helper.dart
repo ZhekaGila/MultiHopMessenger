@@ -1,6 +1,7 @@
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
+import '../models/network_log.dart';
 import '../models/message.dart';
 
 class DatabaseHelper {
@@ -8,6 +9,31 @@ class DatabaseHelper {
 
   static final DatabaseHelper instance = DatabaseHelper._();
   static Database? _database;
+
+  static Future<void> _createNetworkLogsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE network_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        message_id TEXT,
+        device_id TEXT NOT NULL,
+        peer_id TEXT,
+        hop_count INTEGER,
+        details TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE INDEX idx_network_logs_timestamp
+      ON network_logs(timestamp)
+    ''');
+
+    await db.execute('''
+      CREATE INDEX idx_network_logs_message_id
+      ON network_logs(message_id)
+    ''');
+  }
 
   Future<Database> get database async {
     if (_database != null) return _database!;
@@ -17,7 +43,7 @@ class DatabaseHelper {
 
     _database = await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE messages (
@@ -40,6 +66,13 @@ class DatabaseHelper {
           CREATE INDEX idx_messages_status
           ON messages(status)
         ''');
+
+        await _createNetworkLogsTable(db);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await _createNetworkLogsTable(db);
+        }
       },
     );
 
@@ -189,6 +222,55 @@ class DatabaseHelper {
       where: 'sender_id = ?',
       whereArgs: ['phone_a'],
     );
+  }
+
+  Future<int> insertNetworkLog(NetworkLog log) async {
+    final db = await database;
+
+    return db.insert('network_logs', log.toMap());
+  }
+
+  Future<List<NetworkLog>> getNetworkLogs({
+    String? eventType,
+    int limit = 200,
+  }) async {
+    final db = await database;
+
+    final rows = await db.query(
+      'network_logs',
+      where: eventType == null ? null : 'event_type = ?',
+      whereArgs: eventType == null ? null : [eventType],
+      orderBy: 'timestamp DESC, id DESC',
+      limit: limit,
+    );
+
+    return rows.map(NetworkLog.fromMap).toList();
+  }
+
+  Future<int> getNetworkLogCount() async {
+    final db = await database;
+
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) AS total FROM network_logs',
+    );
+
+    return Sqflite.firstIntValue(result) ?? 0;
+  }
+
+  Future<List<NetworkLog>> getAllNetworkLogs() async {
+    final db = await database;
+
+    final rows = await db.query(
+      'network_logs',
+      orderBy: 'timestamp ASC, id ASC',
+    );
+
+    return rows.map(NetworkLog.fromMap).toList();
+  }
+
+  Future<void> clearNetworkLogs() async {
+    final db = await database;
+    await db.delete('network_logs');
   }
 
   Future<void> close() async {
