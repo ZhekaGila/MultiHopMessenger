@@ -32,6 +32,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final RoutingService routingService = RoutingService.instance;
   final MessageService messageService = MessageService.instance;
+  final NetworkLogger networkLogger = NetworkLogger.instance;
 
   final bluetoothService = BluetoothService.instance;
 
@@ -99,18 +100,38 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<bool> sendPacketToDevice(String address, String packet) async {
     if (!connectedAddresses.contains(address)) {
       debugPrint('Device not connected: $address');
+
+      networkLogger.log(
+        eventType: 'SEND_FAILED',
+        deviceId: localDeviceId,
+        peerId: peerIdsByAddress[address],
+        details: 'Device not connected: $address',
+      );
+
       return false;
     }
 
     try {
-      final result = await bluetoothService.invokeString(
-        'sendMessageToDevice',
-        {'address': address, 'message': packet},
+      final sent = await bluetoothService.sendPacket(address, packet);
+
+      networkLogger.log(
+        eventType: sent ? 'SEND' : 'SEND_FAILED',
+        deviceId: localDeviceId,
+        peerId: peerIdsByAddress[address],
+        details: 'Bluetooth packet to $address',
       );
 
-      return result == 'Message sent';
+      return sent;
     } on PlatformException catch (e) {
       debugPrint('Bluetooth send error: ${e.message}');
+
+      networkLogger.log(
+        eventType: 'SEND_FAILED',
+        deviceId: localDeviceId,
+        peerId: peerIdsByAddress[address],
+        details: 'Bluetooth error: ${e.message}',
+      );
+
       return false;
     }
   }
@@ -196,15 +217,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     if (message.status == 'delivered') {
+      debugPrint('ACK ignored: message already delivered');
       return;
     }
 
     if (message.receiverId == senderDeviceId) {
       await DatabaseHelper.instance.updateMessageStatus(messageId, 'delivered');
 
+      networkLogger.log(
+        eventType: 'ACK',
+        deviceId: localDeviceId,
+        messageId: messageId,
+        peerId: senderDeviceId,
+        hopCount: message.hopCount,
+        details: 'Final recipient acknowledged message',
+      );
+
       debugPrint('Message delivered: $messageId');
     } else {
       await DatabaseHelper.instance.updateMessageStatus(messageId, 'forwarded');
+
+      networkLogger.log(
+        eventType: 'ACK',
+        deviceId: localDeviceId,
+        messageId: messageId,
+        peerId: senderDeviceId,
+        hopCount: message.hopCount,
+        details: 'Relay acknowledged message',
+      );
 
       debugPrint('Message forwarded to relay: $messageId');
     }
@@ -291,6 +331,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (success) {
         debugPrint('Forwarded message ${message.id} to $destinationId');
+
+        networkLogger.log(
+          eventType: 'FORWARD',
+          deviceId: localDeviceId,
+          messageId: message.id,
+          peerId: peerIdsByAddress[address],
+          hopCount: message.hopCount + 1,
+          details: 'Forwarded to $address',
+        );
       } else {
         debugPrint('Forwarding failed: ${message.id}');
         break;
@@ -307,6 +356,15 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       final packetType = data['type'];
+
+      networkLogger.log(
+        eventType: 'RECEIVE',
+        deviceId: localDeviceId,
+        peerId: peerIdsByAddress[senderAddress],
+        messageId: data['messageId']?.toString(),
+        hopCount: (data['hopCount'] as num?)?.toInt(),
+        details: 'Packet type: $packetType; from: $senderAddress',
+      );
 
       if (packetType == 'peers') {
         final updatedRoutes = routingService.processPeersPacket(
@@ -335,6 +393,7 @@ class _HomeScreenState extends State<HomeScreen> {
         });
 
         debugPrint('Reachable peers updated: $reachablePeers');
+
         return;
       }
 
@@ -438,6 +497,13 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       }
 
+      networkLogger.log(
+        eventType: 'CONNECT',
+        deviceId: localDeviceId,
+        peerId: peerIdsByAddress[address],
+        details: 'Bluetooth connected: $address',
+      );
+
       return;
     }
 
@@ -454,7 +520,15 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       }
 
+      networkLogger.log(
+        eventType: 'DISCONNECT',
+        deviceId: localDeviceId,
+        peerId: peerIdsByAddress[address],
+        details: 'Bluetooth disconnected: $address',
+      );
+
       loadConnectedDevices();
+
       return;
     }
 
@@ -1105,11 +1179,18 @@ class _HomeScreenState extends State<HomeScreen> {
             label: 'Chats',
           ),
           NavigationDestination(icon: Icon(Icons.bluetooth), label: 'Devices'),
+          NavigationDestination(
+            icon: Icon(Icons.list_alt),
+            selectedIcon: Icon(Icons.list_alt_outlined),
+            label: 'Logs',
+          ),
         ],
       ),
       body: selectedTab == 0
           ? (selectedPeerId == null ? buildChatsTab() : buildConversationTab())
-          : buildDevicesTab(),
+          : selectedTab == 1
+          ? buildDevicesTab()
+          : const NetworkLogsScreen(),
     );
   }
 }

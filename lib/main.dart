@@ -9,9 +9,11 @@ import 'services/device_identity.dart';
 import 'services/bluetooth_service.dart';
 import 'services/routing_service.dart';
 import 'services/message_service.dart';
+import 'services/network_logger.dart';
 
 import 'dart:convert';
 
+import 'screens/network_logs_screen.dart';
 part 'screens/home_screen.dart';
 part 'widgets/devices_tab.dart';
 part 'widgets/chats_tab.dart';
