@@ -14,6 +14,17 @@ extension _ChatsTabBuilder on _HomeScreenState {
       itemCount: conversationPeerIds.length,
       itemBuilder: (context, index) {
         final peerId = conversationPeerIds[index];
+        final directConnection = findAddressByDeviceId(peerId) != null;
+        final routeAvailable = findNextHopAddress(peerId) != null;
+        final unreadCount = unreadMessagesByPeer[peerId] ?? 0;
+        final reachability = directConnection
+            ? 'Connected'
+            : routeAvailable
+            ? 'Route available'
+            : 'Offline';
+        final reachabilityColor = directConnection || routeAvailable
+            ? Colors.green
+            : Colors.grey;
 
         return FutureBuilder<Message?>(
           future: DatabaseHelper.instance.getLastConversationMessage(
@@ -23,13 +34,15 @@ extension _ChatsTabBuilder on _HomeScreenState {
           builder: (context, snapshot) {
             final lastMessage = snapshot.data;
 
-            String subtitle = 'No messages yet';
+            String latestMessage = 'No messages yet';
             String time = '';
 
             if (lastMessage != null) {
               final isMine = lastMessage.senderId == localDeviceId;
 
-              subtitle = isMine ? 'You: ${lastMessage.text}' : lastMessage.text;
+              latestMessage = isMine
+                  ? 'You: ${lastMessage.text}'
+                  : lastMessage.text;
 
               final localTime = lastMessage.createdAt.toLocal();
 
@@ -39,12 +52,27 @@ extension _ChatsTabBuilder on _HomeScreenState {
             }
 
             return ListTile(
-              leading: const CircleAvatar(child: Icon(Icons.person)),
+              leading: CircleAvatar(
+                child: Icon(
+                  Icons.person,
+                  color: reachabilityColor,
+                ),
+              ),
               title: Text('Device ${peerId.substring(0, 8)}'),
-              subtitle: Text(
-                subtitle,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    latestMessage,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    reachability,
+                    style: TextStyle(color: reachabilityColor, fontSize: 12),
+                  ),
+                ],
               ),
               trailing: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -54,7 +82,20 @@ extension _ChatsTabBuilder on _HomeScreenState {
                     time,
                     style: const TextStyle(fontSize: 12, color: Colors.grey),
                   ),
-                  const Icon(Icons.chevron_right),
+                  if (unreadCount > 0)
+                    CircleAvatar(
+                      radius: 10,
+                      backgroundColor: Theme.of(context).colorScheme.primary,
+                      child: Text(
+                        unreadCount > 99 ? '99+' : '$unreadCount',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                        ),
+                      ),
+                    )
+                  else
+                    const Icon(Icons.chevron_right),
                 ],
               ),
               onTap: () {

@@ -21,11 +21,11 @@ extension _ConversationTabBuilder on _HomeScreenState {
           ),
           title: Text('Device ${peerId.substring(0, 8)}'),
           subtitle: Text(
-            connectedAddresses.any(
-                  (address) => peerIdsByAddress[address] == peerId,
-                )
-                ? 'Connected'
-                : 'Offline',
+            findAddressByDeviceId(peerId) != null
+                ? 'Connected directly'
+                : findNextHopAddress(peerId) != null
+                ? 'Route available via another device'
+                : 'Offline — no route available',
           ),
         ),
 
@@ -35,6 +35,7 @@ extension _ConversationTabBuilder on _HomeScreenState {
           child: conversationMessages.isEmpty
               ? const Center(child: Text('No messages yet'))
               : ListView.builder(
+                  controller: scrollController,
                   padding: const EdgeInsets.all(12),
                   itemCount: conversationMessages.length,
                   itemBuilder: (context, index) {

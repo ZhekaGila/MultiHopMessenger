@@ -14,14 +14,6 @@ class BluetoothDeviceInfo {
   }
 }
 
-class ChatMessage {
-  final String text;
-  final bool isMine;
-  final DateTime time;
-
-  ChatMessage({required this.text, required this.isMine, required this.time});
-}
-
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -38,7 +30,6 @@ class _HomeScreenState extends State<HomeScreen> {
   final bluetoothService = BluetoothService.instance;
 
   final messageController = TextEditingController();
-  final receiverController = TextEditingController();
   final scrollController = ScrollController();
 
   StreamSubscription<dynamic>? eventSubscription;
@@ -53,8 +44,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   bool isScanning = false;
 
-  List<ChatMessage> messages = [];
-
   bool sending = false;
 
   int selectedTab = 0;
@@ -64,6 +53,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String? selectedPeerId;
 
   List<Message> conversationMessages = [];
+
+  final Map<String, int> unreadMessagesByPeer = {};
 
   bool loadingMessages = false;
 
@@ -323,21 +314,38 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (!mounted) return;
 
+      final isOpenConversation =
+          selectedTab == 0 && selectedPeerId == savedMessage.senderId;
       setState(() {
-        messages.add(
-          ChatMessage(
-            text: savedMessage.text,
-            isMine: false,
-            time: savedMessage.createdAt,
-          ),
-        );
-
-        if (selectedPeerId == savedMessage.senderId) {
+        if (isOpenConversation) {
           conversationMessages.add(savedMessage);
+        } else {
+          unreadMessagesByPeer.update(
+            savedMessage.senderId,
+            (count) => count + 1,
+            ifAbsent: () => 1,
+          );
         }
       });
 
-      scrollToBottom();
+      if (isOpenConversation) {
+        scrollToBottom();
+      } else if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text(
+                'New message from Device ${savedMessage.senderId.substring(0, 8)}',
+              ),
+              action: SnackBarAction(
+                label: 'Open',
+                onPressed: () => openConversation(savedMessage.senderId),
+              ),
+              duration: const Duration(seconds: 4),
+            ),
+          );
+      }
 
       await loadConversations();
     } catch (e) {
@@ -848,114 +856,6 @@ class _HomeScreenState extends State<HomeScreen> {
     return route.nextHopAddress;
   }
 
-  Future<void> sendMessage() async {
-    final text = messageController.text.trim();
-
-    final enteredReceiverId = receiverController.text.trim();
-
-    final destinationId = enteredReceiverId.isNotEmpty
-        ? enteredReceiverId
-        : connectedAddresses.length == 1
-        ? (peerIdsByAddress[connectedAddresses.first] ?? '')
-        : '';
-
-    final destinationAddress = findAddressByDeviceId(destinationId);
-
-    if (text.isEmpty ||
-        !isConnected ||
-        sending ||
-        localDeviceId.isEmpty ||
-        destinationId.isEmpty) {
-      return;
-    }
-
-    if (destinationAddress == null) {
-      setState(() {
-        status = 'Destination device is not directly connected';
-      });
-      return;
-    }
-    setState(() {
-      sending = true;
-    });
-
-    try {
-      final message = Message.create(
-        senderId: localDeviceId,
-        receiverId: destinationId,
-        text: text,
-      );
-
-      final result = await bluetoothService.invokeString(
-        'sendMessageToDevice',
-        {'address': destinationAddress, 'message': message.toWireJson()},
-      );
-
-      if (!mounted) return;
-
-      if (result == 'Message sent') {
-        final savedMessage = message.copyWith(status: 'sent');
-
-        await DatabaseHelper.instance.insertMessage(savedMessage);
-
-        setState(() {
-          messages.add(
-            ChatMessage(text: text, isMine: true, time: DateTime.now()),
-          );
-
-          messageController.clear();
-          status = 'Message sent';
-        });
-
-        scrollToBottom();
-      } else {
-        setState(() {
-          status = result ?? 'Send failed';
-        });
-      }
-    } on PlatformException catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        status = 'Send error: ${e.message}';
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          sending = false;
-        });
-      }
-    }
-  }
-
-  Future<void> testDatabase() async {
-    try {
-      final message = Message.create(
-        senderId: 'test_phone_a',
-        receiverId: 'test_phone_b',
-        text: 'Hello SQLite!',
-      );
-
-      await DatabaseHelper.instance.insertMessage(message);
-
-      final savedMessages = await DatabaseHelper.instance.getAllMessages();
-
-      if (!mounted) return;
-
-      setState(() {
-        status =
-            'SQLite works! Saved message: '
-            '${savedMessages.length}';
-      });
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        status = 'SQLite error: $e';
-      });
-    }
-  }
-
   Future<void> loadConversations() async {
     if (localDeviceId.isEmpty) return;
 
@@ -980,67 +880,6 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         loadingConversations = false;
         status = 'Failed to load conversations: $e';
-      });
-    }
-  }
-
-  Future<void> loadMessagesFromDatabase() async {
-    try {
-      final savedMessages = await DatabaseHelper.instance.getAllMessages();
-      final chatMessages = savedMessages
-          .where(
-            (message) =>
-                message.senderId == localDeviceId ||
-                message.receiverId == localDeviceId,
-          )
-          .toList();
-
-      if (!mounted) return;
-
-      setState(() {
-        messages = chatMessages.map((message) {
-          return ChatMessage(
-            text: message.text,
-            isMine: message.senderId == localDeviceId,
-            time: message.createdAt,
-          );
-        }).toList();
-      });
-
-      scrollToBottom();
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        status = 'Database error: $e';
-      });
-    }
-  }
-
-  Future<void> saveIncomingMessage(String text) async {
-    try {
-      final message = Message.create(
-        senderId: 'remote_device',
-        receiverId: localDeviceId,
-        text: text,
-      ).copyWith(status: 'received');
-
-      await DatabaseHelper.instance.insertMessage(message);
-
-      if (!mounted) return;
-
-      setState(() {
-        messages.add(
-          ChatMessage(text: text, isMine: false, time: message.createdAt),
-        );
-      });
-
-      scrollToBottom();
-    } catch (e) {
-      if (!mounted) return;
-
-      setState(() {
-        status = 'Failed to save incoming message: $e';
       });
     }
   }
@@ -1118,8 +957,6 @@ class _HomeScreenState extends State<HomeScreen> {
       });
 
       await DatabaseHelper.instance.migrateLegacySenderId(id);
-      await loadMessagesFromDatabase();
-
       await loadConversations();
 
       if (isConnected) {
@@ -1139,9 +976,11 @@ class _HomeScreenState extends State<HomeScreen> {
     messageController.clear();
 
     setState(() {
+      selectedTab = 0;
       selectedPeerId = peerId;
       conversationMessages = [];
       loadingMessages = true;
+      unreadMessagesByPeer.remove(peerId);
     });
 
     try {
@@ -1156,6 +995,7 @@ class _HomeScreenState extends State<HomeScreen> {
         conversationMessages = savedMessages;
         loadingMessages = false;
       });
+      scrollToBottom();
     } catch (e) {
       if (!mounted || selectedPeerId != peerId) return;
 
@@ -1277,7 +1117,6 @@ class _HomeScreenState extends State<HomeScreen> {
     eventSubscription?.cancel();
     messageController.dispose();
     scrollController.dispose();
-    receiverController.dispose();
     super.dispose();
   }
 

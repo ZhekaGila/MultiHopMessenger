@@ -12,17 +12,6 @@ extension _DevicesTabBuilder on _HomeScreenState {
 
         const SizedBox(height: 12),
 
-        TextField(
-          controller: receiverController,
-          decoration: const InputDecoration(
-            labelText: 'Destination UUID',
-            hintText: 'Enter receiver device UUID',
-            border: OutlineInputBorder(),
-          ),
-        ),
-
-        const SizedBox(height: 8),
-
         SelectableText(localDeviceId.isEmpty ? 'Loading...' : localDeviceId),
         const SizedBox(height: 8),
         const Text(
@@ -192,85 +181,6 @@ extension _DevicesTabBuilder on _HomeScreenState {
           child: const Text('Disconnect'),
         ),
 
-        const SizedBox(height: 12),
-
-        ElevatedButton(
-          onPressed: testDatabase,
-          child: const Text('Test SQLite'),
-        ),
-
-        const Divider(height: 30),
-
-        const Text(
-          'Bluetooth Chat',
-          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-        ),
-
-        const SizedBox(height: 12),
-
-        Container(
-          height: 260,
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            border: Border.all(color: Colors.grey.shade300),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: messages.isEmpty
-              ? const Center(child: Text('No messages yet'))
-              : ListView.builder(
-                  controller: scrollController,
-                  itemCount: messages.length,
-                  itemBuilder: (context, index) {
-                    final message = messages[index];
-
-                    return Align(
-                      alignment: message.isMine
-                          ? Alignment.centerRight
-                          : Alignment.centerLeft,
-                      child: Container(
-                        constraints: const BoxConstraints(maxWidth: 260),
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: message.isMine
-                              ? Colors.blue.shade100
-                              : Colors.grey.shade200,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(message.text),
-                      ),
-                    );
-                  },
-                ),
-        ),
-
-        const SizedBox(height: 12),
-
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: messageController,
-                enabled: isConnected,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => sendMessage(),
-                decoration: const InputDecoration(
-                  hintText: 'Type a message...',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ),
-
-            const SizedBox(width: 8),
-
-            IconButton.filled(
-              onPressed: isConnected && !sending ? sendMessage : null,
-              icon: const Icon(Icons.send),
-            ),
-          ],
-        ),
-
-        const SizedBox(height: 20),
       ],
     );
   }
